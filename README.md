@@ -30,6 +30,15 @@ The extension is not packaged. Load it directly (pi uses `jiti`, so no build ste
 npx @earendil-works/pi-coding-agent --extension ./files-api.ts
 ```
 
+To load it automatically in every session, copy `files-api.ts` into the pi agent extensions directory:
+
+```bash
+mkdir -p ~/.pi/agent/extensions
+cp files-api.ts ~/.pi/agent/extensions/
+```
+
+pi auto-loads every extension in that directory, so no `--extension` flag is needed.
+
 ## Configuration
 
 Configuration is read from the pi agent `models.json` (`<agent-dir>/models.json`, normally `~/.pi/agent/models.json`). It is **opt-in**: without a `filesApi` entry the extension does nothing.
