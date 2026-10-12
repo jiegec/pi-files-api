@@ -139,7 +139,18 @@ Statistics include images seen, blocks transformed, uploads (count and bytes), c
 
 Some gateways advertise OpenAI-/Anthropic-compatible chat endpoints without implementing the Files API. In that case the upload returns e.g. `404 path not found: /v1/files`, and the extension falls back to inline images. Point `filesApi.baseUrl` at an endpoint that supports the Files API, or disable the extension for that provider.
 
+## Tests
+
+The suite needs no install or build step: Node 22 runs the TypeScript directly and a small loader stubs the pi package. From the repository root:
+
+```bash
+node --import ./test/register.mjs --test test/files-api.test.ts
+```
+
+It covers opt-in and config resolution, OpenAI/Anthropic payload rewrites, auth overrides, upload shape (`flavor`, `purpose`, `expires_after`), the in-memory and on-disk `file_id` cache, failure fallback, backoff, and the `/files-api` command.
+
 ## Files
 
 - `files-api.ts` — the extension.
+- `test/` — Node test runner suite and the pi package stub/loader.
 - `files-api-cache.json` — persisted `hash -> file_id` cache (created at runtime in the agent directory).

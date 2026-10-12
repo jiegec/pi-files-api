@@ -167,17 +167,17 @@ interface ModelsJsonProvider {
 	modelOverrides?: Record<string, { filesApi?: boolean | FilesApiEntryConfig }>;
 }
 
-let modelsJsonCache: { mtimeMs: number; raw: ModelsJson } | undefined;
+let modelsJsonCache: { path: string; mtimeMs: number; raw: ModelsJson } | undefined;
 
 function readModelsJson(): ModelsJson | undefined {
 	const path = join(getAgentDir(), "models.json");
 	try {
 		const stat = statSync(path);
-		if (modelsJsonCache && modelsJsonCache.mtimeMs === stat.mtimeMs) {
+		if (modelsJsonCache && modelsJsonCache.path === path && modelsJsonCache.mtimeMs === stat.mtimeMs) {
 			return modelsJsonCache.raw;
 		}
 		const raw = JSON.parse(readFileSync(path, "utf8")) as ModelsJson;
-		modelsJsonCache = { mtimeMs: stat.mtimeMs, raw };
+		modelsJsonCache = { path, mtimeMs: stat.mtimeMs, raw };
 		return raw;
 	} catch {
 		return undefined;
