@@ -56,7 +56,7 @@ const CACHE_VERSION = 1;
 const CACHE_FILE = "files-api-cache.json";
 /** APIs whose payload we know how to rewrite. */
 const COMPLETIONS_API = "openai-completions";
-const RESPONSES_APIS = new Set(["openai-responses", "azure-openai-responses"]);
+const RESPONSES_API = "openai-responses";
 
 interface FilesApiEntryConfig {
 	enabled?: boolean;
@@ -197,17 +197,18 @@ function resolveConfig(pi: ExtensionAPI, model: { provider: string; id: string; 
 		};
 	} else if (entry === true || (entry && typeof entry === "object")) {
 		const obj = entry === true ? {} : entry;
+		const authProvider =
+			typeof obj.authProvider === "string" && obj.authProvider.length > 0 ? obj.authProvider : undefined;
 		config = {
 			enabled: obj.enabled !== false,
 			source: "models.json",
 			baseUrl: typeof obj.baseUrl === "string" && obj.baseUrl.length > 0 ? obj.baseUrl : undefined,
-			authProvider:
-				typeof obj.authProvider === "string" && obj.authProvider.length > 0 ? obj.authProvider : undefined,
+			authProvider,
 			apiKey: typeof obj.apiKey === "string" && obj.apiKey.length > 0 ? obj.apiKey : undefined,
 			purpose:
 				typeof obj.purpose === "string" && obj.purpose.length > 0
 					? obj.purpose
-					: defaultPurpose(model.provider),
+					: defaultPurpose(authProvider ?? model.provider),
 			cache: obj.cache !== false,
 			expiresAfterSeconds: normalizeExpires(obj.expiresAfterSeconds),
 		};
@@ -572,7 +573,7 @@ export default function (pi: ExtensionAPI) {
 		if (!model) return;
 		const api = model.api;
 		const isCompletions = api === COMPLETIONS_API;
-		if (!isCompletions && !RESPONSES_APIS.has(api)) return;
+		if (!isCompletions && api !== RESPONSES_API) return;
 
 		const config = resolveConfig(pi, model);
 		if (!config.enabled) return;
