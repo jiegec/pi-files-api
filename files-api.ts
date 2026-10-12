@@ -2,7 +2,8 @@
  * pi-files-api
  *
  * Instead of embedding images as inline base64 in provider requests, upload each
- * image once to an OpenAI-compatible Files API and reference it by its `file_id`.
+ * image once to a Files API (OpenAI- or Anthropic-shaped) and reference it by its
+ * `file_id`.
  *
  * Supported request APIs:
  *   - openai-completions:  {type:"image_url", image_url:{url:"data:..."}}
@@ -72,8 +73,6 @@ interface FilesApiEntryConfig {
 	baseUrl?: string;
 	/** Files API flavor. Defaults to anthropic for `anthropic-messages`, else openai. */
 	api?: FilesApiFlavor;
-	enabled?: boolean;
-	baseUrl?: string;
 	/** Use another provider's credentials for the upload. */
 	authProvider?: string;
 	/** Override just the API key (literal or `$ENV_VAR` / `${ENV_VAR}`). */
@@ -157,16 +156,27 @@ function newState(): RuntimeState {
 // models.json
 // ---------------------------------------------------------------------------
 
-let modelsJsonCache: { mtimeMs: number; raw: unknown } | undefined;
+/** The subset of `models.json` this extension reads. */
+interface ModelsJson {
+	providers?: Record<string, ModelsJsonProvider>;
+}
 
-function readModelsJson(): any {
+interface ModelsJsonProvider {
+	filesApi?: boolean | FilesApiEntryConfig;
+	models?: Array<{ id?: string; filesApi?: boolean | FilesApiEntryConfig }>;
+	modelOverrides?: Record<string, { filesApi?: boolean | FilesApiEntryConfig }>;
+}
+
+let modelsJsonCache: { mtimeMs: number; raw: ModelsJson } | undefined;
+
+function readModelsJson(): ModelsJson | undefined {
 	const path = join(getAgentDir(), "models.json");
 	try {
 		const stat = statSync(path);
 		if (modelsJsonCache && modelsJsonCache.mtimeMs === stat.mtimeMs) {
 			return modelsJsonCache.raw;
 		}
-		const raw = JSON.parse(readFileSync(path, "utf8"));
+		const raw = JSON.parse(readFileSync(path, "utf8")) as ModelsJson;
 		modelsJsonCache = { mtimeMs: stat.mtimeMs, raw };
 		return raw;
 	} catch {
@@ -323,10 +333,12 @@ function extensionFor(mimeType: string): string {
 }
 
 function hasAuthHeader(headers: Record<string, string>): boolean {
-	return Object.keys(headers).some((key) => {
-		const lower = key.toLowerCase();
-		return lower === "authorization" || lower === "x-api-key" || lower === "api-key";
-	});
+	return hasHeader(headers, "authorization") || hasHeader(headers, "x-api-key") || hasHeader(headers, "api-key");
+}
+
+function hasHeader(headers: Record<string, string>, name: string): boolean {
+	const lower = name.toLowerCase();
+	return Object.keys(headers).some((key) => key.toLowerCase() === lower);
 }
 
 function formatError(error: unknown): string {
@@ -427,7 +439,7 @@ async function uploadToFilesApi(
 	if (flavor === "anthropic") {
 		// Anthropic-shaped Files API: /v1/files, x-api-key, and the files beta header.
 		url = `${base}/v1/files`;
-		if (!("anthropic-version" in headers)) headers["anthropic-version"] = "2023-06-01";
+		if (!hasHeader(headers, "anthropic-version")) headers["anthropic-version"] = "2023-06-01";
 		addBetaHeader(headers, FILES_API_BETA);
 		if (!hasAuthHeader(headers) && apiKey) headers["x-api-key"] = apiKey;
 	} else {
@@ -471,23 +483,15 @@ async function uploadImage(
 	const hash = createHash("sha256").update(image.bytes).digest("hex");
 	// Key by endpoint + auth scope so providers that share a Files API reuse uploads.
 	const endpoint = (config.baseUrl ?? ctx.model?.baseUrl ?? "unknown").replace(/\/+$/, "");
-	const authScope = config.authProvider ?? "self";
-	const key = `${authScope}|${endpoint}:${hash}`;
+	const scopeKey = `${config.authProvider ?? "self"}|${endpoint}`;
+	const key = `${scopeKey}:${hash}`;
 
-	// After repeated failures (for example an endpoint without a Files API),
-	// stop retrying for a while so every turn does not pay the round trip.
-	const backoff = state.backoffUntil.get(endpoint);
-	if (backoff && backoff > Date.now()) {
-		state.skipped += 1;
-		return undefined;
-	}
-
+	// A cached file_id is always reusable, even while the endpoint is in backoff.
 	const inMemory = state.memory.get(key);
 	if (inMemory) {
 		state.cacheHits += 1;
 		return inMemory;
 	}
-
 	if (config.cache) {
 		const cached = loadFileCache().entries[key];
 		if (cached?.id) {
@@ -495,6 +499,14 @@ async function uploadImage(
 			state.cacheHits += 1;
 			return cached.id;
 		}
+	}
+
+	// After repeated failures (for example an endpoint without a Files API),
+	// stop retrying for a while so every turn does not pay the round trip.
+	const backoff = state.backoffUntil.get(scopeKey);
+	if (backoff && backoff > Date.now()) {
+		state.skipped += 1;
+		return undefined;
 	}
 
 	const inflight = state.inflight.get(key);
@@ -507,8 +519,8 @@ async function uploadImage(
 			state.bytesUploaded += image.bytes.length;
 			state.lastUploadAt = Date.now();
 			state.lastFileId = id;
-			state.failureCounts.delete(endpoint);
-			state.backoffUntil.delete(endpoint);
+			state.failureCounts.delete(scopeKey);
+			state.backoffUntil.delete(scopeKey);
 			if (config.cache) {
 				loadFileCache().entries[key] = {
 					id,
@@ -522,10 +534,10 @@ async function uploadImage(
 		.catch((error) => {
 			state.failures += 1;
 			state.lastError = formatError(error);
-			const count = (state.failureCounts.get(endpoint) ?? 0) + 1;
-			state.failureCounts.set(endpoint, count);
-			if (count >= 3 && !state.backoffUntil.has(endpoint)) {
-				state.backoffUntil.set(endpoint, Date.now() + 5 * 60_000);
+			const count = (state.failureCounts.get(scopeKey) ?? 0) + 1;
+			state.failureCounts.set(scopeKey, count);
+			if (count >= 3 && !state.backoffUntil.has(scopeKey)) {
+				state.backoffUntil.set(scopeKey, Date.now() + 5 * 60_000);
 			}
 			// Keep the inline image so the request still has a chance to succeed.
 			if (ctx.mode === "tui") {
@@ -738,7 +750,8 @@ function formatStatus(ctx: ExtensionContext, pi: ExtensionAPI): string {
 		`provider/model: ${model.provider}/${model.id}`,
 		`api: ${model.api}`,
 		`files api: ${flavor} (${endpoint})`,
-		`auth: ${config.authProvider ? `provider:${config.authProvider}` : "current provider"}${config.apiKey ? " + apiKey override" : ""
+		`auth: ${config.authProvider ? `provider:${config.authProvider}` : "current provider"}${
+			config.apiKey ? " + apiKey override" : ""
 		}`,
 		`purpose: ${config.purpose}`,
 		`expires_after: ${config.expiresAfterSeconds ?? "never"}${config.expiresAfterSeconds ? "s" : ""}`,
