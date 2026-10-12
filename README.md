@@ -1,5 +1,7 @@
 # pi-files-api
 
+[![CI](https://github.com/jiegec/pi-files-api/actions/workflows/ci.yml/badge.svg)](https://github.com/jiegec/pi-files-api/actions/workflows/ci.yml)
+
 A single-file [pi](https://github.com/earendil-works/pi) extension that stops embedding images as inline base64 in provider requests. Instead it uploads each image once to a **Files API** (OpenAI- or Anthropic-shaped) and references it by `file_id`.
 
 This is useful for vision models behind OpenAI-/Anthropic-compatible endpoints (for example DeepSeek's `POST /files` and `POST /anthropic/v1/files`) where referencing by file id avoids resending large base64 payloads on every turn and lifts the inline request-size limits.
