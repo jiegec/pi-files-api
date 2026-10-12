@@ -1,0 +1,696 @@
+/**
+ * pi-files-api
+ *
+ * Instead of embedding images as inline base64 in provider requests, upload each
+ * image once to an OpenAI-compatible Files API and reference it by its `file_id`.
+ *
+ * Supported request APIs:
+ *   - openai-completions:  {type:"image_url", image_url:{url:"data:..."}}
+ *                          -> {type:"file", file_id:"file-api-..."}
+ *   - openai-responses:    {type:"input_image", detail, image_url:"data:..."}
+ *                          -> {type:"input_image", file_id:"file-api-..."}
+ *
+ * Configuration is read from the pi agent `models.json`
+ * (`<agent-dir>/models.json`, normally `~/.pi/agent/models.json`).
+ *
+ * The base URL and whether the behaviour applies are taken from that file:
+ *
+ *   {
+ *     "providers": {
+ *       "my-provider": {
+ *         "baseUrl": "https://api.example.com/v1",
+ *         "api": "openai-responses",
+ *         "filesApi": {                       // opt-in switch (provider, model, or modelOverrides)
+ *           "enabled": true,
+ *           "baseUrl": "https://api.deepseek.com", // optional endpoint override
+ *           "authProvider": "deepseek",       // optional: use another provider's credentials
+ *           "apiKey": "$MY_FILES_KEY",        // optional literal/env API key override
+ *           "purpose": "user_data",           // optional (default: user_data, vision for "openai")
+ *           "expiresAfterSeconds": 604800,    // optional (default 604800; null keeps files forever)
+ *           "cache": true                     // optional, persist hash -> file_id on disk
+ *         },
+ *         "models": [
+ *           { "id": "vision-model", "filesApi": true } // optional model-level override
+ *         ]
+ *       }
+ *     }
+ *   }
+ *
+ * The Files API is opt-in: without a `filesApi` entry (or the `--files-api` flag)
+ * it does nothing. `authProvider` uploads with another provider's credentials
+ * (API key, headers, and, unless overridden, its base URL); `apiKey` overrides
+ * just the key (a literal or `$ENV_VAR` / `${ENV_VAR}`).
+ *
+ * Usage:
+ *   npx @earendil-works/pi-coding-agent --extension ./files-api.ts
+ */
+
+import { createHash } from "node:crypto";
+import { mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+
+/** Default lifetime for uploaded files (7 days). */
+const DEFAULT_EXPIRES_AFTER_SECONDS = 604800;
+const CACHE_VERSION = 1;
+const CACHE_FILE = "files-api-cache.json";
+/** APIs whose payload we know how to rewrite. */
+const COMPLETIONS_API = "openai-completions";
+const RESPONSES_APIS = new Set(["openai-responses", "azure-openai-responses"]);
+
+interface FilesApiEntryConfig {
+	enabled?: boolean;
+	baseUrl?: string;
+	/** Use another provider's credentials for the upload. */
+	authProvider?: string;
+	/** Override just the API key (literal or `$ENV_VAR` / `${ENV_VAR}`). */
+	apiKey?: string;
+	purpose?: string;
+	cache?: boolean;
+	/** Seconds until the file expires. `null` keeps files permanently. */
+	expiresAfterSeconds?: number | null;
+}
+
+interface ResolvedConfig {
+	enabled: boolean;
+	source: "models.json" | "default" | "flag";
+	baseUrl?: string;
+	authProvider?: string;
+	apiKey?: string;
+	purpose: string;
+	cache: boolean;
+	expiresAfterSeconds: number | null;
+}
+
+interface CacheEntry {
+	id: string;
+	/** Files API endpoint the file belongs to. */
+	endpoint: string;
+	createdAt: string;
+}
+
+interface CacheFile {
+	version: number;
+	entries: Record<string, CacheEntry>;
+}
+
+interface RuntimeState {
+	/** Images encountered in provider payloads. */
+	imagesSeen: number;
+	/** Image blocks replaced with file references. */
+	transformed: number;
+	/** Successful Files API uploads. */
+	uploaded: number;
+	/** Images served from the in-memory or on-disk file_id cache. */
+	cacheHits: number;
+	/** Failed uploads (the inline image is kept). */
+	failures: number;
+	/** Images left inline because the endpoint is in backoff. */
+	skipped: number;
+	/** Total bytes sent to the Files API. */
+	bytesUploaded: number;
+	lastUploadAt: number | undefined;
+	lastFileId: string | undefined;
+	lastError: string | undefined;
+	memory: Map<string, string>;
+	inflight: Map<string, Promise<string | undefined>>;
+	/** Consecutive failures per endpoint, for backoff. */
+	failureCounts: Map<string, number>;
+	/** Endpoint -> epoch ms until which uploads are skipped. */
+	backoffUntil: Map<string, number>;
+}
+
+function newState(): RuntimeState {
+	return {
+		imagesSeen: 0,
+		transformed: 0,
+		uploaded: 0,
+		cacheHits: 0,
+		failures: 0,
+		skipped: 0,
+		bytesUploaded: 0,
+		lastUploadAt: undefined,
+		lastFileId: undefined,
+		lastError: undefined,
+		memory: new Map(),
+		inflight: new Map(),
+		failureCounts: new Map(),
+		backoffUntil: new Map(),
+	};
+}
+
+// ---------------------------------------------------------------------------
+// models.json
+// ---------------------------------------------------------------------------
+
+let modelsJsonCache: { mtimeMs: number; raw: unknown } | undefined;
+
+function readModelsJson(): any {
+	const path = join(getAgentDir(), "models.json");
+	try {
+		const stat = statSync(path);
+		if (modelsJsonCache && modelsJsonCache.mtimeMs === stat.mtimeMs) {
+			return modelsJsonCache.raw;
+		}
+		const raw = JSON.parse(readFileSync(path, "utf8"));
+		modelsJsonCache = { mtimeMs: stat.mtimeMs, raw };
+		return raw;
+	} catch {
+		return undefined;
+	}
+}
+
+function defaultPurpose(provider: string): string {
+	return provider === "openai" ? "vision" : "user_data";
+}
+
+function normalizeExpires(value: unknown): number | null {
+	if (value === null) return null;
+	if (typeof value === "number" && Number.isFinite(value)) return Math.floor(value);
+	return DEFAULT_EXPIRES_AFTER_SECONDS;
+}
+
+/**
+ * Resolve the files-api configuration for the active model. Precedence:
+ * model definition > model override > provider, then CLI flags override all.
+ */
+function resolveConfig(pi: ExtensionAPI, model: { provider: string; id: string; api: string }): ResolvedConfig {
+	const raw = readModelsJson();
+	const provider = raw?.providers?.[model.provider];
+	const modelDef = Array.isArray(provider?.models)
+		? provider.models.find((entry: any) => entry && entry.id === model.id)
+		: undefined;
+	const override = provider?.modelOverrides?.[model.id];
+	const entry = (modelDef?.filesApi ?? override?.filesApi ?? provider?.filesApi) as
+		| boolean
+		| FilesApiEntryConfig
+		| undefined;
+
+	let config: ResolvedConfig;
+	if (entry === false) {
+		config = {
+			enabled: false,
+			source: "models.json",
+			purpose: defaultPurpose(model.provider),
+			cache: true,
+			expiresAfterSeconds: DEFAULT_EXPIRES_AFTER_SECONDS,
+		};
+	} else if (entry === true || (entry && typeof entry === "object")) {
+		const obj = entry === true ? {} : entry;
+		config = {
+			enabled: obj.enabled !== false,
+			source: "models.json",
+			baseUrl: typeof obj.baseUrl === "string" && obj.baseUrl.length > 0 ? obj.baseUrl : undefined,
+			authProvider:
+				typeof obj.authProvider === "string" && obj.authProvider.length > 0 ? obj.authProvider : undefined,
+			apiKey: typeof obj.apiKey === "string" && obj.apiKey.length > 0 ? obj.apiKey : undefined,
+			purpose:
+				typeof obj.purpose === "string" && obj.purpose.length > 0
+					? obj.purpose
+					: defaultPurpose(model.provider),
+			cache: obj.cache !== false,
+			expiresAfterSeconds: normalizeExpires(obj.expiresAfterSeconds),
+		};
+	} else {
+		// Opt-in: no config entry means disabled unless forced with --files-api.
+		config = {
+			enabled: false,
+			source: "default",
+			purpose: defaultPurpose(model.provider),
+			cache: true,
+			expiresAfterSeconds: DEFAULT_EXPIRES_AFTER_SECONDS,
+		};
+	}
+
+	if (pi.getFlag("files-api") === true) {
+		config.enabled = true;
+		config.source = "flag";
+	}
+	const flagPurpose = pi.getFlag("files-api-purpose");
+	if (typeof flagPurpose === "string" && flagPurpose.length > 0) config.purpose = flagPurpose;
+	const flagBaseUrl = pi.getFlag("files-api-base-url");
+	if (typeof flagBaseUrl === "string" && flagBaseUrl.length > 0) config.baseUrl = flagBaseUrl;
+
+	return config;
+}
+
+// ---------------------------------------------------------------------------
+// Persistent hash -> file_id cache
+// ---------------------------------------------------------------------------
+
+let fileCache: CacheFile | undefined;
+
+function cachePath(): string {
+	return join(getAgentDir(), CACHE_FILE);
+}
+
+function loadFileCache(): CacheFile {
+	if (fileCache) return fileCache;
+	try {
+		const parsed = JSON.parse(readFileSync(cachePath(), "utf8")) as CacheFile;
+		if (parsed && parsed.version === CACHE_VERSION && parsed.entries && typeof parsed.entries === "object") {
+			fileCache = parsed;
+			return fileCache;
+		}
+	} catch {
+		// Missing or invalid cache: start fresh.
+	}
+	fileCache = { version: CACHE_VERSION, entries: {} };
+	return fileCache;
+}
+
+function saveFileCache(): void {
+	if (!fileCache) return;
+	try {
+		const path = cachePath();
+		mkdirSync(dirname(path), { recursive: true });
+		const tmp = `${path}.tmp`;
+		writeFileSync(tmp, JSON.stringify(fileCache, null, 2));
+		renameSync(tmp, path);
+	} catch {
+		// Caching is best-effort; never fail a request over it.
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Files API upload
+// ---------------------------------------------------------------------------
+
+interface DataUriImage {
+	mimeType: string;
+	bytes: Buffer;
+}
+
+const DATA_URI_RE = /^data:([^;,]*)(;base64)?,([\s\S]*)$/;
+
+function parseDataUri(uri: string): DataUriImage | undefined {
+	const match = DATA_URI_RE.exec(uri);
+	if (!match) return undefined;
+	if (match[2] !== ";base64") return undefined;
+	const mimeType = match[1] || "application/octet-stream";
+	return { mimeType, bytes: Buffer.from(match[3], "base64") };
+}
+
+function extensionFor(mimeType: string): string {
+	switch (mimeType) {
+		case "image/jpeg":
+			return "jpg";
+		case "image/png":
+			return "png";
+		case "image/gif":
+			return "gif";
+		case "image/webp":
+			return "webp";
+		default:
+			return "bin";
+	}
+}
+
+function hasAuthHeader(headers: Record<string, string>): boolean {
+	return Object.keys(headers).some((key) => {
+		const lower = key.toLowerCase();
+		return lower === "authorization" || lower === "x-api-key" || lower === "api-key";
+	});
+}
+
+function formatError(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
+}
+
+/** Expand a `$ENV_VAR` / `${ENV_VAR}` config value; otherwise return it verbatim. */
+function resolveApiKey(value: string): string {
+	const match = /^\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?$/.exec(value.trim());
+	if (match) return process.env[match[1]] ?? value;
+	return value;
+}
+
+async function uploadToFilesApi(
+	image: DataUriImage,
+	hash: string,
+	ctx: ExtensionContext,
+	config: ResolvedConfig,
+): Promise<string> {
+	const model = ctx.model;
+	if (!model) throw new Error("no active model");
+
+	let apiKey: string | undefined;
+	let rawHeaders: Record<string, unknown>;
+	let baseUrl: string | undefined;
+
+	if (config.authProvider) {
+		// Reuse another provider's credentials (and, unless overridden, its base URL).
+		const authResult = await ctx.modelRegistry.getProviderAuth(config.authProvider);
+		if (!authResult) throw new Error(`no credentials found for auth provider "${config.authProvider}"`);
+		apiKey = authResult.auth.apiKey;
+		rawHeaders = authResult.auth.headers ?? {};
+		baseUrl =
+			config.baseUrl ??
+			authResult.auth.baseUrl ??
+			ctx.modelRegistry.getProvider(config.authProvider)?.baseUrl ??
+			model.baseUrl;
+	} else {
+		const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+		if (!auth.ok) throw new Error(auth.error);
+		apiKey = auth.apiKey;
+		rawHeaders = auth.headers ?? {};
+		baseUrl = config.baseUrl ?? auth.baseUrl ?? model.baseUrl;
+	}
+
+	const headers: Record<string, string> = {};
+	for (const [key, value] of Object.entries(rawHeaders)) {
+		if (typeof value === "string") headers[key] = value;
+	}
+
+	if (config.apiKey) {
+		// An explicit key wins over any inherited auth header.
+		apiKey = resolveApiKey(config.apiKey);
+		for (const key of Object.keys(headers)) {
+			const lower = key.toLowerCase();
+			if (lower === "authorization" || lower === "x-api-key" || lower === "api-key") delete headers[key];
+		}
+	}
+	if (!hasAuthHeader(headers) && apiKey) {
+		headers.Authorization = `Bearer ${apiKey}`;
+	}
+
+	const url = `${(baseUrl ?? model.baseUrl).replace(/\/+$/, "")}/files`;
+
+	const form = new FormData();
+	form.append("purpose", config.purpose);
+	if (config.expiresAfterSeconds !== null) {
+		// DeepSeek's OpenAI-compatible Files API takes nested form fields.
+		form.append("expires_after[anchor]", "created_at");
+		form.append("expires_after[seconds]", String(config.expiresAfterSeconds));
+	}
+	form.append(
+		"file",
+		new Blob([new Uint8Array(image.bytes)], { type: image.mimeType }),
+		`image-${hash.slice(0, 12)}.${extensionFor(image.mimeType)}`,
+	);
+
+	const response = await fetch(url, {
+		method: "POST",
+		headers,
+		body: form,
+		signal: ctx.signal,
+	});
+	if (!response.ok) {
+		const body = await response.text().catch(() => "");
+		throw new Error(`POST ${url} failed (${response.status}): ${body.slice(0, 400)}`);
+	}
+	const data = (await response.json().catch(() => undefined)) as { id?: unknown } | undefined;
+	if (!data || typeof data.id !== "string" || data.id.length === 0) {
+		throw new Error(`POST ${url} returned no file id`);
+	}
+	return data.id;
+}
+
+async function uploadImage(
+	dataUri: string,
+	ctx: ExtensionContext,
+	config: ResolvedConfig,
+	state: RuntimeState,
+): Promise<string | undefined> {
+	const image = parseDataUri(dataUri);
+	if (!image || !image.mimeType.startsWith("image/") || image.bytes.length === 0) return undefined;
+
+	const hash = createHash("sha256").update(image.bytes).digest("hex");
+	// Key by endpoint + auth scope so providers that share a Files API reuse uploads.
+	const endpoint = (config.baseUrl ?? ctx.model?.baseUrl ?? "unknown").replace(/\/+$/, "");
+	const authScope = config.authProvider ?? "self";
+	const key = `${authScope}|${endpoint}:${hash}`;
+
+	// After repeated failures (for example an endpoint without a Files API),
+	// stop retrying for a while so every turn does not pay the round trip.
+	const backoff = state.backoffUntil.get(endpoint);
+	if (backoff && backoff > Date.now()) {
+		state.skipped += 1;
+		return undefined;
+	}
+
+	const inMemory = state.memory.get(key);
+	if (inMemory) {
+		state.cacheHits += 1;
+		return inMemory;
+	}
+
+	if (config.cache) {
+		const cached = loadFileCache().entries[key];
+		if (cached?.id) {
+			state.memory.set(key, cached.id);
+			state.cacheHits += 1;
+			return cached.id;
+		}
+	}
+
+	const inflight = state.inflight.get(key);
+	if (inflight) return inflight;
+
+	const promise = uploadToFilesApi(image, hash, ctx, config)
+		.then((id) => {
+			state.memory.set(key, id);
+			state.uploaded += 1;
+			state.bytesUploaded += image.bytes.length;
+			state.lastUploadAt = Date.now();
+			state.lastFileId = id;
+			state.failureCounts.delete(endpoint);
+			state.backoffUntil.delete(endpoint);
+			if (config.cache) {
+				loadFileCache().entries[key] = {
+					id,
+					endpoint,
+					createdAt: new Date().toISOString(),
+				};
+				saveFileCache();
+			}
+			return id;
+		})
+		.catch((error) => {
+			state.failures += 1;
+			state.lastError = formatError(error);
+			const count = (state.failureCounts.get(endpoint) ?? 0) + 1;
+			state.failureCounts.set(endpoint, count);
+			if (count >= 3 && !state.backoffUntil.has(endpoint)) {
+				state.backoffUntil.set(endpoint, Date.now() + 5 * 60_000);
+			}
+			// Keep the inline image so the request still has a chance to succeed.
+			if (ctx.mode === "tui") {
+				ctx.ui.notify(`files-api upload failed: ${state.lastError}`, "warning");
+			} else {
+				console.error(`[files-api] upload failed: ${state.lastError}`);
+			}
+			return undefined;
+		})
+		.finally(() => {
+			state.inflight.delete(key);
+		});
+
+	state.inflight.set(key, promise);
+	return promise;
+}
+
+// ---------------------------------------------------------------------------
+// Payload rewriting
+// ---------------------------------------------------------------------------
+
+/**
+ * Recursively replace inline base64 image blocks with Files API `file` references.
+ * Handles both generations of OpenAI-compatible payloads.
+ */
+async function rewriteImages(
+	node: unknown,
+	api: string,
+	upload: (dataUri: string) => Promise<string | undefined>,
+): Promise<void> {
+	if (Array.isArray(node)) {
+		for (const item of node) await rewriteImages(item, api, upload);
+		return;
+	}
+	if (!node || typeof node !== "object") return;
+
+	const record = node as Record<string, any>;
+
+	if (api === COMPLETIONS_API) {
+		if (
+			record.type === "image_url" &&
+			record.image_url &&
+			typeof record.image_url.url === "string" &&
+			record.image_url.url.startsWith("data:")
+		) {
+			const id = await upload(record.image_url.url);
+			if (id) {
+				record.type = "file";
+				record.file_id = id;
+				delete record.image_url;
+			}
+		}
+	} else if (
+		record.type === "input_image" &&
+		typeof record.image_url === "string" &&
+		record.image_url.startsWith("data:")
+	) {
+		const id = await upload(record.image_url);
+		if (id) {
+			record.file_id = id;
+			delete record.image_url;
+			delete record.detail;
+		}
+	}
+
+	for (const value of Object.values(record)) {
+		await rewriteImages(value, api, upload);
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Extension
+// ---------------------------------------------------------------------------
+
+export default function (pi: ExtensionAPI) {
+	let state: RuntimeState = newState();
+
+	pi.registerFlag("files-api", {
+		description: "Force-upload images to the provider Files API and reference them by file id",
+		type: "boolean",
+	});
+	pi.registerFlag("files-api-purpose", {
+		description: "Files API upload purpose (default: user_data, or vision for the openai provider)",
+		type: "string",
+	});
+	pi.registerFlag("files-api-base-url", {
+		description: "Override the Files API base URL (endpoint becomes <baseUrl>/files)",
+		type: "string",
+	});
+
+	pi.on("session_start", () => {
+		state = newState();
+		fileCache = undefined;
+	});
+
+	pi.on("before_provider_request", async (event, ctx) => {
+		const model = ctx.model;
+		if (!model) return;
+		const api = model.api;
+		const isCompletions = api === COMPLETIONS_API;
+		if (!isCompletions && !RESPONSES_APIS.has(api)) return;
+
+		const config = resolveConfig(pi, model);
+		if (!config.enabled) return;
+
+		const payload = event.payload as Record<string, any> | undefined;
+		if (!payload || typeof payload !== "object") return;
+
+		const root = isCompletions ? payload.messages : payload.input;
+		if (!root) return;
+
+		await rewriteImages(root, api, async (dataUri) => {
+			state.imagesSeen += 1;
+			const id = await uploadImage(dataUri, ctx, config, state);
+			if (id) state.transformed += 1;
+			return id;
+		});
+
+		// The payload was mutated in place; hand it back explicitly so chained
+		// handlers and the provider see the rewritten images.
+		return payload;
+	});
+
+	pi.registerCommand("files-api", {
+		description: "Show Files API status/stats (subcommands: stats, clear, retry, help)",
+		handler: async (args, ctx) => {
+			const subcommand = args.trim().toLowerCase();
+
+			if (subcommand === "clear" || subcommand === "cache clear") {
+				const diskEntries = loadFileCache().entries;
+				const memoryOnly = [...state.memory.keys()].filter((key) => !diskEntries[key]).length;
+				const removed = Object.keys(diskEntries).length + memoryOnly;
+				state = newState();
+				fileCache = { version: CACHE_VERSION, entries: {} };
+				saveFileCache();
+				ctx.ui.notify(
+					`files-api cache cleared (${removed} file_id record${removed === 1 ? "" : "s"})`,
+					"info",
+				);
+				return;
+			}
+
+			if (subcommand === "stats") {
+				ctx.ui.notify(formatStats(ctx, pi, state), "info");
+				return;
+			}
+
+			if (subcommand === "retry") {
+				state.failureCounts.clear();
+				state.backoffUntil.clear();
+				ctx.ui.notify("files-api backoff reset; uploads will be retried", "info");
+				return;
+			}
+
+			if (subcommand === "help") {
+				ctx.ui.notify(
+					[
+						"/files-api          status + stats",
+						"/files-api stats    counters only",
+						"/files-api clear    drop the local file_id cache",
+						"/files-api retry    reset upload backoff",
+					].join("\n"),
+					"info",
+				);
+				return;
+			}
+
+			// Default: status + stats together.
+			ctx.ui.notify([formatStatus(ctx, pi), "", formatStats(ctx, pi, state)].join("\n"), "info");
+		},
+	});
+}
+
+function formatStatus(ctx: ExtensionContext, pi: ExtensionAPI): string {
+	const model = ctx.model;
+	if (!model) return "files-api: no active model";
+	const config = resolveConfig(pi, model);
+	return [
+		`files-api: ${config.enabled ? "enabled" : "disabled"} (source: ${config.source})`,
+		`provider/model: ${model.provider}/${model.id}`,
+		`api: ${model.api}`,
+		`endpoint: ${(config.baseUrl ?? model.baseUrl).replace(/\/+$/, "")}/files`,
+		`auth: ${config.authProvider ? `provider:${config.authProvider}` : "current provider"}${config.apiKey ? " + apiKey override" : ""
+		}`,
+		`purpose: ${config.purpose}`,
+		`expires_after: ${config.expiresAfterSeconds ?? "never"}${config.expiresAfterSeconds ? "s" : ""}`,
+	].join("\n");
+}
+
+function formatBytes(bytes: number): string {
+	if (bytes < 1024) return `${bytes} B`;
+	if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
+	return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
+}
+
+function formatStats(ctx: ExtensionContext, pi: ExtensionAPI, state: RuntimeState): string {
+	const model = ctx.model;
+	const config = model ? resolveConfig(pi, model) : undefined;
+	const cached = loadFileCache();
+	const diskCount = Object.keys(cached.entries).length;
+	const lines = [
+		"files-api stats:",
+		`images seen: ${state.imagesSeen}`,
+		`transformed: ${state.transformed}`,
+		`uploads: ${state.uploaded} (${formatBytes(state.bytesUploaded)})`,
+		`cache hits: ${state.cacheHits}`,
+		`failures: ${state.failures}`,
+		`skipped (backoff): ${state.skipped}`,
+		`in-flight: ${state.inflight.size}`,
+		`file_ids: ${state.memory.size} memory / ${diskCount} disk`,
+	];
+	if (config && !config.cache) lines.push("disk cache: disabled");
+	if (state.backoffUntil.size > 0) {
+		for (const [endpoint, until] of state.backoffUntil) {
+			lines.push(`backoff: ${endpoint} until ${new Date(until).toISOString()}`);
+		}
+	}
+	if (state.lastUploadAt) lines.push(`last upload: ${new Date(state.lastUploadAt).toISOString()}`);
+	if (state.lastFileId) lines.push(`last file id: ${state.lastFileId}`);
+	if (state.lastError) lines.push(`last error: ${state.lastError}`);
+	return lines.join("\n");
+}
