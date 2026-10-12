@@ -9,6 +9,8 @@
  *                          -> {type:"file", file_id:"file-api-..."}
  *   - openai-responses:    {type:"input_image", detail, image_url:"data:..."}
  *                          -> {type:"input_image", file_id:"file-api-..."}
+ *   - anthropic-messages:  {type:"image", source:{type:"base64", media_type, data}}
+ *                          -> {type:"image", source:{type:"file", file_id:"file-api-..."}}
  *
  * Configuration is read from the pi agent `models.json`
  * (`<agent-dir>/models.json`, normally `~/.pi/agent/models.json`).
@@ -23,6 +25,7 @@
  *         "filesApi": {                       // opt-in switch (provider, model, or modelOverrides)
  *           "enabled": true,
  *           "baseUrl": "https://api.deepseek.com", // optional endpoint override
+ *           "api": "openai",                  // optional "openai" | "anthropic" Files API flavor
  *           "authProvider": "deepseek",       // optional: use another provider's credentials
  *           "apiKey": "$MY_FILES_KEY",        // optional literal/env API key override
  *           "purpose": "user_data",           // optional (default: user_data, vision for "openai")
@@ -57,8 +60,18 @@ const CACHE_FILE = "files-api-cache.json";
 /** APIs whose payload we know how to rewrite. */
 const COMPLETIONS_API = "openai-completions";
 const RESPONSES_API = "openai-responses";
+const ANTHROPIC_API = "anthropic-messages";
+/** Required when the Anthropic Messages API references a Files API id. */
+const FILES_API_BETA = "files-api-2025-04-14";
+
+/** Files API flavor: OpenAI-shaped (`/files`) or Anthropic-shaped (`/v1/files`). */
+type FilesApiFlavor = "openai" | "anthropic";
 
 interface FilesApiEntryConfig {
+	enabled?: boolean;
+	baseUrl?: string;
+	/** Files API flavor. Defaults to anthropic for `anthropic-messages`, else openai. */
+	api?: FilesApiFlavor;
 	enabled?: boolean;
 	baseUrl?: string;
 	/** Use another provider's credentials for the upload. */
@@ -75,6 +88,7 @@ interface ResolvedConfig {
 	enabled: boolean;
 	source: "models.json" | "default" | "flag";
 	baseUrl?: string;
+	api?: FilesApiFlavor;
 	authProvider?: string;
 	apiKey?: string;
 	purpose: string;
@@ -203,6 +217,7 @@ function resolveConfig(pi: ExtensionAPI, model: { provider: string; id: string; 
 			enabled: obj.enabled !== false,
 			source: "models.json",
 			baseUrl: typeof obj.baseUrl === "string" && obj.baseUrl.length > 0 ? obj.baseUrl : undefined,
+			api: obj.api === "openai" || obj.api === "anthropic" ? obj.api : undefined,
 			authProvider,
 			apiKey: typeof obj.apiKey === "string" && obj.apiKey.length > 0 ? obj.apiKey : undefined,
 			purpose:
@@ -318,6 +333,35 @@ function formatError(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }
 
+/** Append a beta feature to an `anthropic-beta` header value. */
+function addBetaHeader(headers: Record<string, string>, beta: string): void {
+	const key = Object.keys(headers).find((name) => name.toLowerCase() === "anthropic-beta");
+	if (!key) {
+		headers["anthropic-beta"] = beta;
+		return;
+	}
+	const parts = (headers[key] ?? "")
+		.split(",")
+		.map((part) => part.trim())
+		.filter((part) => part.length > 0);
+	if (!parts.includes(beta)) parts.push(beta);
+	headers[key] = parts.join(",");
+}
+
+/** Add a beta feature to an Anthropic messages payload (pi turns `betas` into the header). */
+function addPayloadBeta(payload: Record<string, any>, beta: string): void {
+	const current = payload.betas;
+	if (Array.isArray(current)) {
+		if (!current.includes(beta)) current.push(beta);
+	} else if (typeof current === "string" && current.length > 0) {
+		const parts = current.split(",").map((part) => part.trim()).filter((part) => part.length > 0);
+		if (!parts.includes(beta)) parts.push(beta);
+		payload.betas = parts;
+	} else {
+		payload.betas = [beta];
+	}
+}
+
 /** Expand a `$ENV_VAR` / `${ENV_VAR}` config value; otherwise return it verbatim. */
 function resolveApiKey(value: string): string {
 	const match = /^\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?$/.exec(value.trim());
@@ -330,6 +374,7 @@ async function uploadToFilesApi(
 	hash: string,
 	ctx: ExtensionContext,
 	config: ResolvedConfig,
+	flavor: FilesApiFlavor,
 ): Promise<string> {
 	const model = ctx.model;
 	if (!model) throw new Error("no active model");
@@ -370,24 +415,31 @@ async function uploadToFilesApi(
 			if (lower === "authorization" || lower === "x-api-key" || lower === "api-key") delete headers[key];
 		}
 	}
-	if (!hasAuthHeader(headers) && apiKey) {
-		headers.Authorization = `Bearer ${apiKey}`;
-	}
-
-	const url = `${(baseUrl ?? model.baseUrl).replace(/\/+$/, "")}/files`;
-
+	const base = (baseUrl ?? model.baseUrl).replace(/\/+$/, "");
 	const form = new FormData();
-	form.append("purpose", config.purpose);
-	if (config.expiresAfterSeconds !== null) {
-		// DeepSeek's OpenAI-compatible Files API takes nested form fields.
-		form.append("expires_after[anchor]", "created_at");
-		form.append("expires_after[seconds]", String(config.expiresAfterSeconds));
-	}
 	form.append(
 		"file",
 		new Blob([new Uint8Array(image.bytes)], { type: image.mimeType }),
 		`image-${hash.slice(0, 12)}.${extensionFor(image.mimeType)}`,
 	);
+
+	let url: string;
+	if (flavor === "anthropic") {
+		// Anthropic-shaped Files API: /v1/files, x-api-key, and the files beta header.
+		url = `${base}/v1/files`;
+		if (!("anthropic-version" in headers)) headers["anthropic-version"] = "2023-06-01";
+		addBetaHeader(headers, FILES_API_BETA);
+		if (!hasAuthHeader(headers) && apiKey) headers["x-api-key"] = apiKey;
+	} else {
+		url = `${base}/files`;
+		form.append("purpose", config.purpose);
+		if (config.expiresAfterSeconds !== null) {
+			// DeepSeek's OpenAI-compatible Files API takes nested form fields.
+			form.append("expires_after[anchor]", "created_at");
+			form.append("expires_after[seconds]", String(config.expiresAfterSeconds));
+		}
+		if (!hasAuthHeader(headers) && apiKey) headers.Authorization = `Bearer ${apiKey}`;
+	}
 
 	const response = await fetch(url, {
 		method: "POST",
@@ -411,6 +463,7 @@ async function uploadImage(
 	ctx: ExtensionContext,
 	config: ResolvedConfig,
 	state: RuntimeState,
+	flavor: FilesApiFlavor,
 ): Promise<string | undefined> {
 	const image = parseDataUri(dataUri);
 	if (!image || !image.mimeType.startsWith("image/") || image.bytes.length === 0) return undefined;
@@ -447,7 +500,7 @@ async function uploadImage(
 	const inflight = state.inflight.get(key);
 	if (inflight) return inflight;
 
-	const promise = uploadToFilesApi(image, hash, ctx, config)
+	const promise = uploadToFilesApi(image, hash, ctx, config, flavor)
 		.then((id) => {
 			state.memory.set(key, id);
 			state.uploaded += 1;
@@ -496,7 +549,7 @@ async function uploadImage(
 
 /**
  * Recursively replace inline base64 image blocks with Files API `file` references.
- * Handles both generations of OpenAI-compatible payloads.
+ * Handles OpenAI-compatible and Anthropic payloads.
  */
 async function rewriteImages(
 	node: unknown,
@@ -524,6 +577,22 @@ async function rewriteImages(
 				record.file_id = id;
 				delete record.image_url;
 			}
+		}
+	} else if (api === ANTHROPIC_API) {
+		const source = record.source;
+		if (
+			record.type === "image" &&
+			source &&
+			typeof source === "object" &&
+			source.type === "base64" &&
+			typeof source.data === "string"
+		) {
+			const mimeType =
+				typeof source.media_type === "string" && source.media_type.length > 0
+					? source.media_type
+					: "image/png";
+			const id = await upload(`data:${mimeType};base64,${source.data}`);
+			if (id) record.source = { type: "file", file_id: id };
 		}
 	} else if (
 		record.type === "input_image" &&
@@ -559,7 +628,7 @@ export default function (pi: ExtensionAPI) {
 		type: "string",
 	});
 	pi.registerFlag("files-api-base-url", {
-		description: "Override the Files API base URL (endpoint becomes <baseUrl>/files)",
+		description: "Override the Files API base URL (<baseUrl>/files, or <baseUrl>/v1/files for Anthropic)",
 		type: "string",
 	});
 
@@ -573,7 +642,8 @@ export default function (pi: ExtensionAPI) {
 		if (!model) return;
 		const api = model.api;
 		const isCompletions = api === COMPLETIONS_API;
-		if (!isCompletions && api !== RESPONSES_API) return;
+		const isAnthropic = api === ANTHROPIC_API;
+		if (!isCompletions && !isAnthropic && api !== RESPONSES_API) return;
 
 		const config = resolveConfig(pi, model);
 		if (!config.enabled) return;
@@ -581,15 +651,25 @@ export default function (pi: ExtensionAPI) {
 		const payload = event.payload as Record<string, any> | undefined;
 		if (!payload || typeof payload !== "object") return;
 
-		const root = isCompletions ? payload.messages : payload.input;
+		// OpenAI-compatible and Anthropic payloads both carry messages; only the
+		// Responses API uses `input`.
+		const root = isCompletions || isAnthropic ? payload.messages : payload.input;
 		if (!root) return;
 
+		const flavor: FilesApiFlavor = config.api ?? (isAnthropic ? "anthropic" : "openai");
+		let replacedInRequest = 0;
 		await rewriteImages(root, api, async (dataUri) => {
 			state.imagesSeen += 1;
-			const id = await uploadImage(dataUri, ctx, config, state);
-			if (id) state.transformed += 1;
+			const id = await uploadImage(dataUri, ctx, config, state, flavor);
+			if (id) {
+				state.transformed += 1;
+				replacedInRequest += 1;
+			}
 			return id;
 		});
+
+		// The Anthropic Messages API needs the files beta when a file id is used.
+		if (isAnthropic && replacedInRequest > 0) addPayloadBeta(payload, FILES_API_BETA);
 
 		// The payload was mutated in place; hand it back explicitly so chained
 		// handlers and the provider see the rewritten images.
@@ -650,11 +730,14 @@ function formatStatus(ctx: ExtensionContext, pi: ExtensionAPI): string {
 	const model = ctx.model;
 	if (!model) return "files-api: no active model";
 	const config = resolveConfig(pi, model);
+	const flavor: FilesApiFlavor = config.api ?? (model.api === ANTHROPIC_API ? "anthropic" : "openai");
+	const base = (config.baseUrl ?? model.baseUrl).replace(/\/+$/, "");
+	const endpoint = flavor === "anthropic" ? `${base}/v1/files` : `${base}/files`;
 	return [
 		`files-api: ${config.enabled ? "enabled" : "disabled"} (source: ${config.source})`,
 		`provider/model: ${model.provider}/${model.id}`,
 		`api: ${model.api}`,
-		`endpoint: ${(config.baseUrl ?? model.baseUrl).replace(/\/+$/, "")}/files`,
+		`files api: ${flavor} (${endpoint})`,
 		`auth: ${config.authProvider ? `provider:${config.authProvider}` : "current provider"}${config.apiKey ? " + apiKey override" : ""
 		}`,
 		`purpose: ${config.purpose}`,

@@ -1,19 +1,22 @@
 # pi-files-api
 
-A single-file [pi](https://github.com/earendil-works/pi) extension that stops embedding images as inline base64 in provider requests. Instead it uploads each image once to an OpenAI-compatible **Files API** and references it by `file_id`.
+A single-file [pi](https://github.com/earendil-works/pi) extension that stops embedding images as inline base64 in provider requests. Instead it uploads each image once to a **Files API** (OpenAI- or Anthropic-shaped) and references it by `file_id`.
 
-This is useful for vision models behind OpenAI-compatible endpoints (for example DeepSeek's `POST /files`) where referencing by file id avoids resending large base64 payloads on every turn and lifts the inline request-size limits.
+This is useful for vision models behind OpenAI-/Anthropic-compatible endpoints (for example DeepSeek's `POST /files` and `POST /anthropic/v1/files`) where referencing by file id avoids resending large base64 payloads on every turn and lifts the inline request-size limits.
 
 ## How it works
 
-The extension hooks `before_provider_request`, walks the outgoing payload, finds base64 `data:` images, uploads each unique image with `POST <baseUrl>/files` (multipart), then rewrites the block in place:
+The extension hooks `before_provider_request`, walks the outgoing payload, finds base64 `data:` images, uploads each unique image (multipart), then rewrites the block in place:
 
 | API | Before | After |
 | --- | --- | --- |
 | `openai-completions` | `{ "type": "image_url", "image_url": { "url": "data:…" } }` | `{ "type": "file", "file_id": "file-api-…" }` |
 | `openai-responses` | `{ "type": "input_image", "detail": "auto", "image_url": "data:…" }` | `{ "type": "input_image", "file_id": "file-api-…" }` |
+| `anthropic-messages` | `{ "type": "image", "source": { "type": "base64", "media_type": "image/jpeg", "data": "…" } }` | `{ "type": "image", "source": { "type": "file", "file_id": "file-api-…" } }` |
 
-Supported APIs: `openai-completions` and `openai-responses`. Inline `http(s)` image URLs are left untouched.
+Supported APIs: `openai-completions`, `openai-responses`, and `anthropic-messages`. Inline `http(s)` image URLs are left untouched.
+
+The Files API flavor follows the request API: OpenAI-shaped (`POST <baseUrl>/files`) for `openai-*`, Anthropic-shaped (`POST <baseUrl>/v1/files`) for `anthropic-messages`. Override it with the `api` option. When an Anthropic payload is rewritten, `files-api-2025-04-14` is added to the `anthropic-beta` header, which the Messages API requires when referencing a Files API id.
 
 Uploads are deduplicated by a SHA-256 hash of the image bytes (in memory and, optionally, on disk) and by endpoint, so the same image is uploaded once per session at most. The `file_id` is stable across turns, which keeps prompt prefixes stable.
 
@@ -41,6 +44,7 @@ A `filesApi` entry can be placed on the provider, on a specific model, or in `mo
       "filesApi": {
         "enabled": true,
         "baseUrl": "https://api.deepseek.com",
+        "api": "openai",
         "authProvider": "deepseek",
         "apiKey": "$MY_FILES_KEY",
         "purpose": "user_data",
@@ -61,11 +65,12 @@ A `filesApi` entry can be placed on the provider, on a specific model, or in `mo
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `enabled` | boolean | `true` when the entry exists | Enable the rewrite. |
-| `baseUrl` | string | active model's `baseUrl` | Files API base; the endpoint is `<baseUrl>/files`. |
+| `baseUrl` | string | active model's `baseUrl` | Files API base: endpoint `<baseUrl>/files` (openai) or `<baseUrl>/v1/files` (anthropic). |
+| `api` | `"openai"` \| `"anthropic"` | from the request API | Files API flavor and upload shape. |
 | `authProvider` | string | — | Use **another provider's** credentials: API key and headers, plus that provider's base URL unless `baseUrl` is set. |
 | `apiKey` | string | — | Override just the API key. Literal, `$ENV_VAR`, or `${ENV_VAR}`. Replaces any inherited auth header. |
-| `purpose` | string | `user_data` (`vision` for provider `openai`) | Multipart `purpose` field. |
-| `expiresAfterSeconds` | number \| null | `604800` (7 days) | Lifetime. Sent as `expires_after[anchor]=created_at` and `expires_after[seconds]=<n>`; `null` keeps files permanently. |
+| `purpose` | string | `user_data` (`vision` for provider `openai`) | Multipart `purpose` field (openai flavor only). |
+| `expiresAfterSeconds` | number \| null | `604800` (7 days) | Lifetime; sent as `expires_after[anchor]=created_at` + `expires_after[seconds]=<n>` (openai flavor only); `null` keeps files permanently. |
 | `cache` | boolean | `true` | Persist `hash -> file_id` to disk across sessions. |
 
 `"filesApi": true` enables with defaults; `"filesApi": false` disables.
@@ -90,6 +95,8 @@ Keep the active provider's endpoint but use a different key (a literal, or an en
 
 `authProvider` needs the referenced provider to have usable credentials configured in pi (via `/login`, `auth.json`, its environment variable, or `apiKey` in `models.json`). `getProviderAuth()` returns nothing when the provider is unconfigured, and the upload is skipped.
 
+The upload authenticates with `Authorization: Bearer <key>` for the openai flavor and `x-api-key: <key>` for the anthropic flavor (plus `anthropic-version` and the `anthropic-beta: files-api-2025-04-14` header).
+
 ## CLI flags
 
 | Flag | Description |
@@ -97,6 +104,8 @@ Keep the active provider's endpoint but use a different key (a literal, or an en
 | `--files-api` | Force-enable without a `models.json` entry, using the current provider's auth. |
 | `--files-api-purpose <p>` | Override the multipart `purpose`. |
 | `--files-api-base-url <url>` | Override the Files API base URL. |
+
+The flavor is inferred from the request API; there is no flag for it (set `filesApi.api` in `models.json` instead).
 
 ```bash
 npx @earendil-works/pi-coding-agent \
@@ -125,10 +134,10 @@ Statistics include images seen, blocks transformed, uploads (count and bytes), c
 
 ## Requirements
 
-- A provider that implements an OpenAI-compatible Files API at `<baseUrl>/files`, and a model that supports image input.
+- A provider that implements the configured Files API (`POST <baseUrl>/files` for openai, `POST <baseUrl>/v1/files` for anthropic), and a model that supports image input.
 - Node 18+ (uses the global `fetch`, `FormData`, and `Blob`).
 
-Some gateways advertise OpenAI-compatible chat/responses endpoints without implementing `/files`. In that case the upload returns e.g. `404 path not found: /v1/files`, and the extension falls back to inline images. Point `filesApi.baseUrl` at an endpoint that supports the Files API, or disable the extension for that provider.
+Some gateways advertise OpenAI-/Anthropic-compatible chat endpoints without implementing the Files API. In that case the upload returns e.g. `404 path not found: /v1/files`, and the extension falls back to inline images. Point `filesApi.baseUrl` at an endpoint that supports the Files API, or disable the extension for that provider.
 
 ## Files
 
