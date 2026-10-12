@@ -56,7 +56,7 @@ import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil
 
 /** Default lifetime for uploaded files (7 days). */
 const DEFAULT_EXPIRES_AFTER_SECONDS = 604800;
-const CACHE_VERSION = 1;
+const CACHE_VERSION = 3;
 const CACHE_FILE = "files-api-cache.json";
 /** APIs whose payload we know how to rewrite. */
 const COMPLETIONS_API = "openai-completions";
@@ -64,6 +64,9 @@ const RESPONSES_API = "openai-responses";
 const ANTHROPIC_API = "anthropic-messages";
 /** Required when the Anthropic Messages API references a Files API id. */
 const FILES_API_BETA = "files-api-2025-04-14";
+/** Anthropic `expires_in_seconds` bounds (1 hour .. 90 days). */
+const ANTHROPIC_MIN_EXPIRES_SECONDS = 3_600;
+const ANTHROPIC_MAX_EXPIRES_SECONDS = 7_776_000;
 
 /** Files API flavor: OpenAI-shaped (`/files`) or Anthropic-shaped (`/v1/files`). */
 type FilesApiFlavor = "openai" | "anthropic";
@@ -95,8 +98,13 @@ interface ResolvedConfig {
 	expiresAfterSeconds: number | null;
 }
 
-interface CacheEntry {
+interface CachedFile {
 	id: string;
+	/** RFC 3339 UTC timestamp at which the file expires; undefined means it never expires. */
+	expiresAt?: string;
+}
+
+interface CacheEntry extends CachedFile {
 	/** Files API endpoint the file belongs to. */
 	endpoint: string;
 	createdAt: string;
@@ -120,12 +128,14 @@ interface RuntimeState {
 	failures: number;
 	/** Images left inline because the endpoint is in backoff. */
 	skipped: number;
+	/** Expired cached entries that were dropped. */
+	expired: number;
 	/** Total bytes sent to the Files API. */
 	bytesUploaded: number;
 	lastUploadAt: number | undefined;
 	lastFileId: string | undefined;
 	lastError: string | undefined;
-	memory: Map<string, string>;
+	memory: Map<string, CachedFile>;
 	inflight: Map<string, Promise<string | undefined>>;
 	/** Consecutive failures per endpoint, for backoff. */
 	failureCounts: Map<string, number>;
@@ -141,6 +151,7 @@ function newState(): RuntimeState {
 		cacheHits: 0,
 		failures: 0,
 		skipped: 0,
+		expired: 0,
 		bytesUploaded: 0,
 		lastUploadAt: undefined,
 		lastFileId: undefined,
@@ -270,18 +281,48 @@ function cachePath(): string {
 	return join(getAgentDir(), CACHE_FILE);
 }
 
+function isExpired(entry: CachedFile, now = Date.now()): boolean {
+	if (entry.expiresAt === undefined) return false;
+	const expiresAtMs = Date.parse(entry.expiresAt);
+	return Number.isFinite(expiresAtMs) && expiresAtMs <= now;
+}
+
+/** Drop expired entries from the loaded cache. Returns how many were removed. */
+function pruneExpiredFileCache(): number {
+	if (!fileCache) return 0;
+	const now = Date.now();
+	let removed = 0;
+	for (const [key, entry] of Object.entries(fileCache.entries)) {
+		if (isExpired(entry, now)) {
+			delete fileCache.entries[key];
+			removed += 1;
+		}
+	}
+	return removed;
+}
+
+/** Remove one entry from the on-disk cache, saving only if it was present. */
+function dropDiskEntry(key: string): void {
+	const cache = loadFileCache();
+	if (cache.entries[key]) {
+		delete cache.entries[key];
+		saveFileCache();
+	}
+}
+
 function loadFileCache(): CacheFile {
 	if (fileCache) return fileCache;
+	let loaded: CacheFile | undefined;
 	try {
 		const parsed = JSON.parse(readFileSync(cachePath(), "utf8")) as CacheFile;
 		if (parsed && parsed.version === CACHE_VERSION && parsed.entries && typeof parsed.entries === "object") {
-			fileCache = parsed;
-			return fileCache;
+			loaded = parsed;
 		}
 	} catch {
 		// Missing or invalid cache: start fresh.
 	}
-	fileCache = { version: CACHE_VERSION, entries: {} };
+	fileCache = loaded ?? { version: CACHE_VERSION, entries: {} };
+	if (pruneExpiredFileCache() > 0) saveFileCache();
 	return fileCache;
 }
 
@@ -374,11 +415,31 @@ function addPayloadBeta(payload: Record<string, any>, beta: string): void {
 	}
 }
 
+/**
+ * Parse a Files API `expires_at`: Unix seconds for the OpenAI flavor, an RFC 3339
+ * string for the Anthropic flavor. Returns an RFC 3339 UTC timestamp, or undefined.
+ */
+function parseExpiresAt(value: unknown): string | undefined {
+	let ms: number | undefined;
+	if (typeof value === "number" && Number.isFinite(value) && value > 0) {
+		ms = Math.floor(value) * 1000;
+	} else if (typeof value === "string" && value.length > 0) {
+		const parsed = Date.parse(value);
+		if (Number.isFinite(parsed)) ms = parsed;
+	}
+	return ms === undefined ? undefined : new Date(ms).toISOString();
+}
+
 /** Expand a `$ENV_VAR` / `${ENV_VAR}` config value; otherwise return it verbatim. */
 function resolveApiKey(value: string): string {
 	const match = /^\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?$/.exec(value.trim());
 	if (match) return process.env[match[1]] ?? value;
 	return value;
+}
+
+interface UploadResult {
+	id: string;
+	expiresAt?: string;
 }
 
 async function uploadToFilesApi(
@@ -387,7 +448,7 @@ async function uploadToFilesApi(
 	ctx: ExtensionContext,
 	config: ResolvedConfig,
 	flavor: FilesApiFlavor,
-): Promise<string> {
+): Promise<UploadResult> {
 	const model = ctx.model;
 	if (!model) throw new Error("no active model");
 
@@ -435,6 +496,18 @@ async function uploadToFilesApi(
 		`image-${hash.slice(0, 12)}.${extensionFor(image.mimeType)}`,
 	);
 
+	// Both flavors expire files at upload time, but with different form fields and
+	// ranges. Anthropic only accepts 1 hour..90 days, so clamp to stay valid.
+	const expiresSeconds =
+		config.expiresAfterSeconds === null
+			? null
+			: flavor === "anthropic"
+				? Math.min(
+						ANTHROPIC_MAX_EXPIRES_SECONDS,
+						Math.max(ANTHROPIC_MIN_EXPIRES_SECONDS, Math.floor(config.expiresAfterSeconds)),
+					)
+				: Math.floor(config.expiresAfterSeconds);
+
 	let url: string;
 	if (flavor === "anthropic") {
 		// Anthropic-shaped Files API: /v1/files, x-api-key, and the files beta header.
@@ -442,13 +515,14 @@ async function uploadToFilesApi(
 		if (!hasHeader(headers, "anthropic-version")) headers["anthropic-version"] = "2023-06-01";
 		addBetaHeader(headers, FILES_API_BETA);
 		if (!hasAuthHeader(headers) && apiKey) headers["x-api-key"] = apiKey;
+		if (expiresSeconds !== null) form.append("expires_in_seconds", String(expiresSeconds));
 	} else {
 		url = `${base}/files`;
 		form.append("purpose", config.purpose);
-		if (config.expiresAfterSeconds !== null) {
+		if (expiresSeconds !== null) {
 			// DeepSeek's OpenAI-compatible Files API takes nested form fields.
 			form.append("expires_after[anchor]", "created_at");
-			form.append("expires_after[seconds]", String(config.expiresAfterSeconds));
+			form.append("expires_after[seconds]", String(expiresSeconds));
 		}
 		if (!hasAuthHeader(headers) && apiKey) headers.Authorization = `Bearer ${apiKey}`;
 	}
@@ -463,11 +537,19 @@ async function uploadToFilesApi(
 		const body = await response.text().catch(() => "");
 		throw new Error(`POST ${url} failed (${response.status}): ${body.slice(0, 400)}`);
 	}
-	const data = (await response.json().catch(() => undefined)) as { id?: unknown } | undefined;
+	const data = (await response.json().catch(() => undefined)) as
+		| { id?: unknown; expires_at?: unknown }
+		| undefined;
 	if (!data || typeof data.id !== "string" || data.id.length === 0) {
 		throw new Error(`POST ${url} returned no file id`);
 	}
-	return data.id;
+
+	// Prefer the server's expiry; fall back to the lifetime we requested.
+	let expiresAt = parseExpiresAt(data.expires_at);
+	if (expiresAt === undefined && expiresSeconds !== null) {
+		expiresAt = new Date(Date.now() + expiresSeconds * 1000).toISOString();
+	}
+	return { id: data.id, expiresAt };
 }
 
 async function uploadImage(
@@ -487,17 +569,28 @@ async function uploadImage(
 	const key = `${scopeKey}:${hash}`;
 
 	// A cached file_id is always reusable, even while the endpoint is in backoff.
+	// Expired entries are ignored and dropped so the image is uploaded again.
 	const inMemory = state.memory.get(key);
 	if (inMemory) {
-		state.cacheHits += 1;
-		return inMemory;
+		if (!isExpired(inMemory)) {
+			state.cacheHits += 1;
+			return inMemory.id;
+		}
+		// Expired: drop it from memory and disk, then re-upload below.
+		state.memory.delete(key);
+		if (config.cache) dropDiskEntry(key);
+		state.expired += 1;
 	}
 	if (config.cache) {
 		const cached = loadFileCache().entries[key];
-		if (cached?.id) {
-			state.memory.set(key, cached.id);
-			state.cacheHits += 1;
-			return cached.id;
+		if (cached) {
+			if (!isExpired(cached)) {
+				state.memory.set(key, { id: cached.id, expiresAt: cached.expiresAt });
+				state.cacheHits += 1;
+				return cached.id;
+			}
+			dropDiskEntry(key);
+			state.expired += 1;
 		}
 	}
 
@@ -513,8 +606,8 @@ async function uploadImage(
 	if (inflight) return inflight;
 
 	const promise = uploadToFilesApi(image, hash, ctx, config, flavor)
-		.then((id) => {
-			state.memory.set(key, id);
+		.then(({ id, expiresAt }) => {
+			state.memory.set(key, { id, expiresAt });
 			state.uploaded += 1;
 			state.bytesUploaded += image.bytes.length;
 			state.lastUploadAt = Date.now();
@@ -526,6 +619,7 @@ async function uploadImage(
 					id,
 					endpoint,
 					createdAt: new Date().toISOString(),
+					expiresAt,
 				};
 				saveFileCache();
 			}
@@ -777,6 +871,7 @@ function formatStats(ctx: ExtensionContext, pi: ExtensionAPI, state: RuntimeStat
 		`cache hits: ${state.cacheHits}`,
 		`failures: ${state.failures}`,
 		`skipped (backoff): ${state.skipped}`,
+		`expired dropped: ${state.expired}`,
 		`in-flight: ${state.inflight.size}`,
 		`file_ids: ${state.memory.size} memory / ${diskCount} disk`,
 	];

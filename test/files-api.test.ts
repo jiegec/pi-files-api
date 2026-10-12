@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -42,11 +42,25 @@ function recordCall(url: string, init: any): RecordedCall {
 	return { url: String(url), method: init?.method, headers: { ...(init?.headers ?? {}) }, form };
 }
 
-function fileResponse(id: string): Response {
-	return new Response(JSON.stringify({ id, object: "file" }), {
+function fileResponse(id: string, expiresAtSeconds?: number): Response {
+	const body: Record<string, unknown> = { id, object: "file" };
+	if (expiresAtSeconds !== undefined) body.expires_at = expiresAtSeconds;
+	return new Response(JSON.stringify(body), {
 		status: 200,
 		headers: { "content-type": "application/json" },
 	});
+}
+
+function secondsFromNow(seconds: number): number {
+	return Math.floor(Date.now() / 1000) + seconds;
+}
+
+interface CacheFileShape {
+	entries: Record<string, { id: string; expiresAt?: string }>;
+}
+
+function readDiskCache(agentDir: string): CacheFileShape {
+	return JSON.parse(readFileSync(join(agentDir, "files-api-cache.json"), "utf8"));
 }
 
 function errorResponse(status: number, body = "boom"): Response {
@@ -323,7 +337,7 @@ test("anthropic rewrites image source and adds the files beta", async (t) => {
 	assert.equal(call.headers["x-api-key"], "self-key");
 	assert.equal(call.headers["anthropic-version"], "2023-06-01");
 	assert.equal(call.headers["anthropic-beta"], "files-api-2025-04-14");
-	assert.deepEqual(call.form.map(([key]) => key), ["file"]);
+	assert.deepEqual(call.form.map(([key]) => key), ["file", "expires_in_seconds"]);
 });
 
 test("anthropic leaves url and existing file sources untouched", async (t) => {
@@ -440,13 +454,6 @@ test("openai upload sends purpose and expires_after by default", async (t) => {
 	assert.equal(formValue(call, "expires_after[seconds]"), "604800");
 });
 
-test("expiresAfterSeconds: null omits the expiry fields", async (t) => {
-	const h = await harness(t, { modelsJson: providerConfig({ enabled: true, expiresAfterSeconds: null }) });
-	h.setFetch(async () => fileResponse("file-n"));
-	await h.emit(completionsPayload(png("a")));
-	assert.equal(formValue(h.calls[0], "expires_after[seconds]"), undefined);
-});
-
 test("purpose override is used", async (t) => {
 	const h = await harness(t, { modelsJson: providerConfig({ enabled: true, purpose: "custom" }) });
 	h.setFetch(async () => fileResponse("file-p"));
@@ -490,6 +497,117 @@ test("concurrent identical images share one in-flight upload", async (t) => {
 	assert.equal(h.calls.length, 1);
 	assert.deepEqual(payloads[0].messages[0].content[1], { type: "file", file_id: "file-conc" });
 	assert.deepEqual(payloads[1].messages[0].content[1], { type: "file", file_id: "file-conc" });
+});
+
+test("expired cached file ids are ignored and re-uploaded", async (t) => {
+	const h = await harness(t, { modelsJson: providerConfig(true) });
+	h.setFetch(async () => fileResponse("file-old", secondsFromNow(-60)));
+	const first = completionsPayload(png("a"));
+	await h.emit(first);
+	assert.deepEqual(first.messages[0].content[1], { type: "file", file_id: "file-old" });
+
+	// The stored entry is already expired, so the next request re-uploads.
+	h.setFetch(async () => fileResponse("file-new", secondsFromNow(3600)));
+	const second = completionsPayload(png("a"));
+	await h.emit(second);
+	assert.deepEqual(second.messages[0].content[1], { type: "file", file_id: "file-new" });
+	assert.equal(h.calls.length, 2);
+	const stats = await h.command("stats");
+	assert.match(stats, /cache hits: 0/);
+	assert.match(stats, /expired dropped: 1/);
+});
+
+test("non-expired cached file ids are reused without a re-upload", async (t) => {
+	const h = await harness(t, { modelsJson: providerConfig(true) });
+	h.setFetch(async () => fileResponse("file-live", secondsFromNow(3600)));
+	await h.emit(completionsPayload(png("a")));
+	await h.emit(completionsPayload(png("a")));
+	assert.equal(h.calls.length, 1);
+	assert.match(await h.command("stats"), /cache hits: 1/);
+});
+
+test("openai uploads record a future expiry derived from expires_after", async (t) => {
+	const h = await harness(t, { modelsJson: providerConfig(true) });
+	h.setFetch(async () => fileResponse("file-exp"));
+	await h.emit(completionsPayload(png("a")));
+	const entry = Object.values(readDiskCache(h.agentDir).entries)[0];
+	assert.equal(typeof entry.expiresAt, "string");
+	assert.ok(Date.parse(entry.expiresAt as string) > Date.now());
+	assert.match(entry.expiresAt as string, /Z$/);
+});
+
+test("anthropic uploads send expires_in_seconds and record a future expiry", async (t) => {
+	const h = await harness(t, {
+		modelsJson: providerConfig(true),
+		model: { api: "anthropic-messages", baseUrl: "https://api.deepseek.com/anthropic" },
+	});
+	h.setFetch(async () => fileResponse("file_anthro"));
+	await h.emit(anthropicPayload(Buffer.from("img").toString("base64")));
+	assert.equal(formValue(h.calls[0], "expires_in_seconds"), "604800");
+	const entry = Object.values(readDiskCache(h.agentDir).entries)[0];
+	assert.equal(typeof entry.expiresAt, "string");
+	assert.ok(Date.parse(entry.expiresAt as string) > Date.now());
+});
+
+test("anthropic parses an RFC 3339 expires_at from the response", async (t) => {
+	const h = await harness(t, {
+		modelsJson: providerConfig(true),
+		model: { api: "anthropic-messages", baseUrl: "https://api.deepseek.com/anthropic" },
+	});
+	const iso = new Date(Date.now() + 123_000).toISOString();
+	h.setFetch(
+		async () =>
+			new Response(JSON.stringify({ id: "file_rfc", type: "file", expires_at: iso }), {
+				status: 200,
+				headers: { "content-type": "application/json" },
+			}),
+	);
+	await h.emit(anthropicPayload(Buffer.from("img").toString("base64")));
+	const entry = Object.values(readDiskCache(h.agentDir).entries)[0];
+	assert.equal(entry.expiresAt, iso);
+});
+
+test("anthropic clamps expires_in_seconds to the allowed range", async (t) => {
+	const h = await harness(t, {
+		modelsJson: providerConfig({ enabled: true, expiresAfterSeconds: 60 }),
+		model: { api: "anthropic-messages", baseUrl: "https://api.deepseek.com/anthropic" },
+	});
+	h.setFetch(async () => fileResponse("file_clamp"));
+	await h.emit(anthropicPayload(Buffer.from("img").toString("base64")));
+	assert.equal(formValue(h.calls[0], "expires_in_seconds"), "3600");
+});
+
+test("expiresAfterSeconds: null omits expiry for both flavors", async (t) => {
+	const openai = await harness(t, { modelsJson: providerConfig({ enabled: true, expiresAfterSeconds: null }) });
+	openai.setFetch(async () => fileResponse("file-none"));
+	await openai.emit(completionsPayload(png("a")));
+	assert.equal(formValue(openai.calls[0], "expires_after[seconds]"), undefined);
+	assert.equal(Object.values(readDiskCache(openai.agentDir).entries)[0].expiresAt, undefined);
+
+	const anthropic = await harness(t, {
+		modelsJson: providerConfig({ enabled: true, expiresAfterSeconds: null }),
+		model: { api: "anthropic-messages", baseUrl: "https://api.deepseek.com/anthropic" },
+	});
+	anthropic.setFetch(async () => fileResponse("file_none_a"));
+	await anthropic.emit(anthropicPayload(Buffer.from("img").toString("base64")));
+	assert.equal(formValue(anthropic.calls[0], "expires_in_seconds"), undefined);
+	assert.equal(Object.values(readDiskCache(anthropic.agentDir).entries)[0].expiresAt, undefined);
+});
+
+test("expired entries are pruned from the disk cache on load", async (t) => {
+	const agentDir = mkdtempSync(join(tmpdir(), "pi-files-api-prune-"));
+	t.after(() => rmSync(agentDir, { recursive: true, force: true }));
+	const modelsJson = providerConfig(true);
+
+	const first = await harness(t, { agentDir, modelsJson });
+	first.setFetch(async () => fileResponse("file-expired", secondsFromNow(-5)));
+	await first.emit(completionsPayload(png("a")));
+	assert.equal(Object.keys(readDiskCache(agentDir).entries).length, 1);
+
+	// A new instance prunes the expired entry when it loads the cache.
+	const second = await harness(t, { agentDir, modelsJson });
+	await second.command("stats");
+	assert.equal(Object.keys(readDiskCache(agentDir).entries).length, 0);
 });
 
 test("file_id cache persists to disk across instances", async (t) => {

@@ -72,7 +72,7 @@ A `filesApi` entry can be placed on the provider, on a specific model, or in `mo
 | `authProvider` | string | — | Use **another provider's** credentials: API key and headers, plus that provider's base URL unless `baseUrl` is set. |
 | `apiKey` | string | — | Override just the API key. Literal, `$ENV_VAR`, or `${ENV_VAR}`. Replaces any inherited auth header. |
 | `purpose` | string | `user_data` (`vision` for provider `openai`) | Multipart `purpose` field (openai flavor only). |
-| `expiresAfterSeconds` | number \| null | `604800` (7 days) | Lifetime; sent as `expires_after[anchor]=created_at` + `expires_after[seconds]=<n>` (openai flavor only); `null` keeps files permanently. |
+| `expiresAfterSeconds` | number \| null | `604800` (7 days) | File lifetime. The openai flavor sends `expires_after[anchor]=created_at` + `expires_after[seconds]=<n>`; the anthropic flavor sends `expires_in_seconds` (clamped to the allowed 3600..7776000). `null` uploads without an expiry. |
 | `cache` | boolean | `true` | Persist `hash -> file_id` to disk across sessions. |
 
 `"filesApi": true` enables with defaults; `"filesApi": false` disables.
@@ -97,7 +97,7 @@ Keep the active provider's endpoint but use a different key (a literal, or an en
 
 `authProvider` needs the referenced provider to have usable credentials configured in pi (via `/login`, `auth.json`, its environment variable, or `apiKey` in `models.json`). `getProviderAuth()` returns nothing when the provider is unconfigured, and the upload is skipped.
 
-The upload authenticates with `Authorization: Bearer <key>` for the openai flavor and `x-api-key: <key>` for the anthropic flavor (plus `anthropic-version` and the `anthropic-beta: files-api-2025-04-14` header).
+The upload authenticates with `Authorization: Bearer <key>` for the openai flavor and `x-api-key: <key>` for the anthropic flavor (plus `anthropic-version` and the `anthropic-beta: files-api-2025-04-14` header). The anthropic flavor sets expiry with the multipart `expires_in_seconds` field.
 
 ## CLI flags
 
@@ -125,13 +125,13 @@ npx @earendil-works/pi-coding-agent \
 | `/files-api retry` | Reset the upload backoff. |
 | `/files-api help` | List subcommands. |
 
-Statistics include images seen, blocks transformed, uploads (count and bytes), cache hits, failures, skipped-due-to-backoff, in-flight uploads, memory/disk `file_id` counts, the last upload time/file id, and the last error.
+Statistics include images seen, blocks transformed, uploads (count and bytes), cache hits, failures, skipped-due-to-backoff, expired-dropped, in-flight uploads, memory/disk `file_id` counts, the last upload time/file id, and the last error.
 
 ## Behavior and safety
 
 - **Fallback:** if an upload fails, the inline image is kept so the request still has a chance to succeed. Failures are surfaced via a TUI warning (or stderr outside the TUI) and recorded for `/files-api`.
 - **Backoff:** after 3 consecutive failures for an endpoint, further uploads to it are skipped for 5 minutes to avoid a failed round trip on every turn. Reset with `/files-api retry`.
-- **Cache:** stored as `files-api-cache.json` in the agent directory. File ids belong to the endpoint + credentials, so the key includes the auth scope; clear it if you change credentials.
+- **Cache:** stored as `files-api-cache.json` in the agent directory, keyed by endpoint + credentials. Each entry remembers its expiry as an RFC 3339 UTC timestamp (the server's `expires_at`, otherwise the configured lifetime); expired entries are ignored and dropped, and the image is uploaded again next time. Clear it with `/files-api clear`.
 - **Concurrency:** parallel requests deduplicate in-flight uploads for the same image.
 
 ## Requirements
