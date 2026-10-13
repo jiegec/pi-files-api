@@ -978,6 +978,31 @@ test("logs to stderr outside the TUI", async (t) => {
 // failures and backoff
 // ---------------------------------------------------------------------------
 
+test("upload log names the endpoint and credential source", async (t) => {
+	const h = await harness(t, {
+		modelsJson: providerConfig({ enabled: true, authProvider: "other" }),
+		providerAuth: { other: { auth: { apiKey: "other-key" } } },
+		providers: { other: { baseUrl: "https://files.example.com" } },
+	});
+	h.setFetch(async () => fileResponse("file-ctx"));
+	await h.emit(completionsPayload(png("a")));
+	assert.equal(h.entries.length, 1);
+	assert.match(h.entries[0].data.detail, /@ https:\/\/files\.example\.com\/files \(provider:other\)/);
+});
+
+test("failure log names the endpoint and credential source", async (t) => {
+	const h = await harness(t, {
+		modelsJson: providerConfig({ enabled: true, authProvider: "other" }),
+		providerAuth: { other: { auth: { apiKey: "other-key" } } },
+		providers: { other: { baseUrl: "https://files.example.com" } },
+	});
+	h.setFetch(async () => errorResponse(500));
+	await h.emit(completionsPayload(png("a")));
+	const warning = h.notifications.find((entry) => entry.message.includes("upload failed"));
+	assert.ok(warning, JSON.stringify(h.notifications));
+	assert.match(warning!.message, /\(provider:other -> https:\/\/files\.example\.com\/files\)/);
+});
+
 test("a failed upload keeps the inline image", async (t) => {
 	const h = await harness(t, { modelsJson: providerConfig(true) });
 	h.setFetch(async () => errorResponse(500));

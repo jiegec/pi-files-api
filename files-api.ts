@@ -48,11 +48,12 @@
  * `$ENV_VAR` / `${ENV_VAR}`).
  *
  * Each upload is logged as a dim line in the transcript (a custom entry, not sent
- * to the model; stderr outside the TUI): `uploaded [<name>] (<size>) <file_id>`.
- * Reuses stay silent; a failure is reported as a warning. For images inside a tool
- * result (e.g. `read`), the name comes from the tool call id, so byte-identical
- * files stay distinct; OpenAI Completions detaches those images, so they are
- * uploaded without a name.
+ * to the model; stderr outside the TUI):
+ * `uploaded [<name>] (<size>) @ <endpoint> (<auth source>) <file_id>`. Reuses stay
+ * silent; a failure is reported as a warning with the same endpoint and auth
+ * source. For images inside a tool result (e.g. `read`), the name comes from the
+ * tool call id, so byte-identical files stay distinct; OpenAI Completions detaches
+ * those images, so they are uploaded without a name.
  *
  * Usage:
  *   npx @earendil-works/pi-coding-agent --extension ./files-api.ts
@@ -84,7 +85,7 @@ type FilesApiFlavor = "openai" | "anthropic";
 const LOG_ENTRY_TYPE = "files-api-log";
 
 /** Report an image upload (`name` is the source file, when known). */
-type UploadLogger = (info: { id: string; name?: string; bytes: number }) => void;
+type UploadLogger = (info: { id: string; name?: string; bytes: number; url: string; auth: string }) => void;
 
 interface FilesApiEntryConfig {
 	enabled?: boolean;
@@ -259,6 +260,17 @@ function resolveFlavor(ctx: ExtensionContext, config: ResolvedConfig, requestApi
 function uploadBaseUrl(ctx: ExtensionContext, config: ResolvedConfig): string {
 	const borrowed = config.authProvider ? ctx.modelRegistry.getProvider(config.authProvider)?.baseUrl : undefined;
 	return (config.baseUrl ?? borrowed ?? ctx.model?.baseUrl ?? "unknown").replace(/\/+$/, "");
+}
+
+/** Full Files API endpoint for a base URL and flavor. */
+function filesApiUrl(baseUrl: string, flavor: FilesApiFlavor): string {
+	return flavor === "anthropic" ? `${baseUrl}/v1/files` : `${baseUrl}/files`;
+}
+
+/** Human-readable source of the upload credentials. */
+function describeAuth(config: ResolvedConfig): string {
+	const provider = config.authProvider ? `provider:${config.authProvider}` : "current provider";
+	return config.apiKey ? `${provider} + apiKey override` : provider;
 }
 
 function normalizeExpires(value: unknown): number | null {
@@ -521,6 +533,8 @@ function resolveApiKey(value: string): string {
 interface UploadResult {
 	id: string;
 	expiresAt?: string;
+	/** The Files API endpoint the file was POSTed to. */
+	url: string;
 }
 
 /** Credentials and base URL used for an upload. */
@@ -614,16 +628,14 @@ async function uploadToFilesApi(
 					)
 				: Math.floor(config.expiresAfterSeconds);
 
-	let url: string;
+	const url = filesApiUrl(base, flavor);
 	if (flavor === "anthropic") {
 		// Anthropic-shaped Files API: /v1/files, x-api-key, and the files beta header.
-		url = `${base}/v1/files`;
 		if (!hasHeader(headers, "anthropic-version")) headers["anthropic-version"] = "2023-06-01";
 		addBetaHeader(headers, FILES_API_BETA);
 		if (!hasAuthHeader(headers) && apiKey) headers["x-api-key"] = apiKey;
 		if (expiresSeconds !== null) form.append("expires_in_seconds", String(expiresSeconds));
 	} else {
-		url = `${base}/files`;
 		form.append("purpose", config.purpose);
 		if (expiresSeconds !== null) {
 			// DeepSeek's OpenAI-compatible Files API takes nested form fields.
@@ -655,7 +667,7 @@ async function uploadToFilesApi(
 	if (expiresAt === undefined && expiresSeconds !== null) {
 		expiresAt = new Date(Date.now() + expiresSeconds * 1000).toISOString();
 	}
-	return { id: data.id, expiresAt };
+	return { id: data.id, expiresAt, url };
 }
 
 async function uploadImage(
@@ -715,8 +727,10 @@ async function uploadImage(
 	if (inflight) return inflight;
 
 	const name = toolCallId ? toolResultNames.get(toolCallId) : undefined;
+	const auth = describeAuth(config);
+	const endpointUrl = filesApiUrl(endpoint, flavor);
 	const promise = uploadToFilesApi(image, hash, ctx, config, flavor, name)
-		.then(({ id, expiresAt }) => {
+		.then(({ id, expiresAt, url }) => {
 			state.memory.set(key, { id, expiresAt });
 			state.uploaded += 1;
 			state.bytesUploaded += image.bytes.length;
@@ -724,7 +738,7 @@ async function uploadImage(
 			state.lastFileId = id;
 			state.failureCounts.delete(scopeKey);
 			state.backoffUntil.delete(scopeKey);
-			log({ id, name, bytes: image.bytes.length });
+			log({ id, name, bytes: image.bytes.length, url, auth });
 			if (config.cache) {
 				loadFileCache().entries[key] = {
 					id,
@@ -745,10 +759,11 @@ async function uploadImage(
 				state.backoffUntil.set(scopeKey, Date.now() + 5 * 60_000);
 			}
 			// Keep the inline image so the request still has a chance to succeed.
+			const context = `${auth} -> ${endpointUrl}`;
 			if (ctx.mode === "tui") {
-				ctx.ui.notify(`files-api upload failed: ${state.lastError}`, "warning");
+				ctx.ui.notify(`files-api upload failed (${context}): ${state.lastError}`, "warning");
 			} else {
-				console.error(`[files-api] upload failed: ${state.lastError}`);
+				console.error(`[files-api] upload failed (${context}): ${state.lastError}`);
 			}
 			return undefined;
 		})
@@ -923,9 +938,10 @@ export default function (pi: ExtensionAPI) {
 		let replacedInRequest = 0;
 		// Print one line per actual upload (reuses stay silent), under the message
 		// being sent. Image blocks carry no file name, so read-tool uploads use the
-		// name learned from the tool result when available.
-		const logUpload: UploadLogger = ({ id, name, bytes }) => {
-			const detail = `uploaded${name ? ` ${name}` : ""} (${formatBytes(bytes)})`;
+		// name learned from the tool result when available. The endpoint and the
+		// credential source are included so a misroute is obvious at a glance.
+		const logUpload: UploadLogger = ({ id, name, bytes, url, auth }) => {
+			const detail = `uploaded${name ? ` ${name}` : ""} (${formatBytes(bytes)}) @ ${url} (${auth})`;
 			if (ctx.mode === "tui") pi.appendEntry(LOG_ENTRY_TYPE, { detail, id });
 			else console.error(`[files-api] ${detail} ${id}`);
 		};
@@ -1003,16 +1019,13 @@ function formatStatus(ctx: ExtensionContext, pi: ExtensionAPI): string {
 	if (!model) return "files-api: no active model";
 	const config = resolveConfig(pi, model);
 	const flavor = resolveFlavor(ctx, config, model.api);
-	const base = uploadBaseUrl(ctx, config);
-	const endpoint = flavor === "anthropic" ? `${base}/v1/files` : `${base}/files`;
+	const endpoint = filesApiUrl(uploadBaseUrl(ctx, config), flavor);
 	return [
 		`files-api: ${config.enabled ? "enabled" : "disabled"} (source: ${config.source})`,
 		`provider/model: ${model.provider}/${model.id}`,
 		`api: ${model.api}`,
 		`files api: ${flavor} (${endpoint})`,
-		`auth: ${config.authProvider ? `provider:${config.authProvider}` : "current provider"}${
-			config.apiKey ? " + apiKey override" : ""
-		}`,
+		`auth: ${describeAuth(config)}`,
 		`purpose: ${config.purpose}`,
 		`expires_after: ${config.expiresAfterSeconds ?? "never"}${config.expiresAfterSeconds ? "s" : ""}`,
 	].join("\n");
