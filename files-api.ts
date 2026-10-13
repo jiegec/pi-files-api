@@ -26,7 +26,7 @@
  *         "filesApi": {                       // opt-in switch (provider, model, or modelOverrides)
  *           "enabled": true,
  *           "baseUrl": "https://api.deepseek.com", // optional endpoint override
- *           "api": "openai",                  // optional "openai" | "anthropic" Files API flavor
+ *           "api": "openai",                   // optional "openai" | "anthropic" flavor (default: authProvider's api, else the request api)
  *           "authProvider": "deepseek",       // optional: use another provider's credentials
  *           "apiKey": "$MY_FILES_KEY",        // optional literal/env API key override
  *           "purpose": "user_data",           // optional (default: user_data, vision for "openai")
@@ -42,8 +42,10 @@
  *
  * The Files API is opt-in: without a `filesApi` entry (or the `--files-api` flag)
  * it does nothing. `authProvider` uploads with another provider's credentials
- * (API key, headers, and, unless overridden, its base URL); `apiKey` overrides
- * just the key (a literal or `$ENV_VAR` / `${ENV_VAR}`).
+ * (API key, headers, and, unless overridden, its base URL) and infers the Files API
+ * flavor from that provider's API, so an Anthropic request can upload to an
+ * OpenAI-shaped Files API; `apiKey` overrides just the key (a literal or
+ * `$ENV_VAR` / `${ENV_VAR}`).
  *
  * Usage:
  *   npx @earendil-works/pi-coding-agent --extension ./files-api.ts
@@ -56,7 +58,7 @@ import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil
 
 /** Default lifetime for uploaded files (7 days). */
 const DEFAULT_EXPIRES_AFTER_SECONDS = 604800;
-const CACHE_VERSION = 3;
+const CACHE_VERSION = 4;
 const CACHE_FILE = "files-api-cache.json";
 /** APIs whose payload we know how to rewrite. */
 const COMPLETIONS_API = "openai-completions";
@@ -74,7 +76,10 @@ type FilesApiFlavor = "openai" | "anthropic";
 interface FilesApiEntryConfig {
 	enabled?: boolean;
 	baseUrl?: string;
-	/** Files API flavor. Defaults to anthropic for `anthropic-messages`, else openai. */
+	/**
+	 * Files API flavor. Defaults to the `authProvider`'s API shape when one is set,
+	 * otherwise to anthropic for `anthropic-messages` and openai for the rest.
+	 */
 	api?: FilesApiFlavor;
 	/** Use another provider's credentials for the upload. */
 	authProvider?: string;
@@ -173,8 +178,10 @@ interface ModelsJson {
 }
 
 interface ModelsJsonProvider {
+	/** Chat API all the provider's models speak, e.g. `openai-completions`. */
+	api?: string;
 	filesApi?: boolean | FilesApiEntryConfig;
-	models?: Array<{ id?: string; filesApi?: boolean | FilesApiEntryConfig }>;
+	models?: Array<{ id?: string; api?: string; filesApi?: boolean | FilesApiEntryConfig }>;
 	modelOverrides?: Record<string, { filesApi?: boolean | FilesApiEntryConfig }>;
 }
 
@@ -197,6 +204,48 @@ function readModelsJson(): ModelsJson | undefined {
 
 function defaultPurpose(provider: string): string {
 	return provider === "openai" ? "vision" : "user_data";
+}
+
+/** Map a chat API name to a Files API flavor, or undefined when it is unknown. */
+function flavorForApi(api: string | undefined): FilesApiFlavor | undefined {
+	if (!api) return undefined;
+	if (api.includes("anthropic")) return "anthropic";
+	if (api.includes("openai") || api.includes("azure")) return "openai";
+	return undefined;
+}
+
+/**
+ * The chat API a provider's models speak: its models.json `api` (provider-level,
+ * else the first model entry that sets one), falling back to the registry catalog.
+ */
+function providerApi(ctx: ExtensionContext, name: string): string | undefined {
+	const entry = readModelsJson()?.providers?.[name];
+	if (typeof entry?.api === "string" && entry.api.length > 0) return entry.api;
+	const modelApi = entry?.models?.find((model) => typeof model.api === "string")?.api;
+	if (typeof modelApi === "string" && modelApi.length > 0) return modelApi;
+	return ctx.modelRegistry.getProvider(name)?.getModels?.()[0]?.api;
+}
+
+/**
+ * Pick the Files API flavor (upload shape, URL path, and auth header). An explicit
+ * `filesApi.api` wins. With `authProvider` the upload borrows that provider's
+ * endpoint and credentials, so follow *its* API shape even when the active request
+ * API differs (e.g. an Anthropic request uploaded to an OpenAI-shaped Files API).
+ * Otherwise follow the request API.
+ */
+function resolveFlavor(ctx: ExtensionContext, config: ResolvedConfig, requestApi: string): FilesApiFlavor {
+	if (config.api) return config.api;
+	if (config.authProvider) {
+		const inferred = flavorForApi(providerApi(ctx, config.authProvider));
+		if (inferred) return inferred;
+	}
+	return requestApi === ANTHROPIC_API ? "anthropic" : "openai";
+}
+
+/** Files API base URL the upload targets (borrowing the auth provider's when set). */
+function uploadBaseUrl(ctx: ExtensionContext, config: ResolvedConfig): string {
+	const borrowed = config.authProvider ? ctx.modelRegistry.getProvider(config.authProvider)?.baseUrl : undefined;
+	return (config.baseUrl ?? borrowed ?? ctx.model?.baseUrl ?? "unknown").replace(/\/+$/, "");
 }
 
 function normalizeExpires(value: unknown): number | null {
@@ -465,8 +514,7 @@ async function uploadToFilesApi(
 		baseUrl =
 			config.baseUrl ??
 			authResult.auth.baseUrl ??
-			ctx.modelRegistry.getProvider(config.authProvider)?.baseUrl ??
-			model.baseUrl;
+			uploadBaseUrl(ctx, config);
 	} else {
 		const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
 		if (!auth.ok) throw new Error(auth.error);
@@ -563,9 +611,10 @@ async function uploadImage(
 	if (!image || !image.mimeType.startsWith("image/") || image.bytes.length === 0) return undefined;
 
 	const hash = createHash("sha256").update(image.bytes).digest("hex");
-	// Key by endpoint + auth scope so providers that share a Files API reuse uploads.
-	const endpoint = (config.baseUrl ?? ctx.model?.baseUrl ?? "unknown").replace(/\/+$/, "");
-	const scopeKey = `${config.authProvider ?? "self"}|${endpoint}`;
+	// Key by endpoint + auth scope + flavor so changing any of them re-uploads
+	// instead of reusing a file id that belongs to a different Files API.
+	const endpoint = uploadBaseUrl(ctx, config);
+	const scopeKey = `${config.authProvider ?? "self"}|${flavor}|${endpoint}`;
 	const key = `${scopeKey}:${hash}`;
 
 	// A cached file_id is always reusable, even while the endpoint is in backoff.
@@ -762,7 +811,7 @@ export default function (pi: ExtensionAPI) {
 		const root = isCompletions || isAnthropic ? payload.messages : payload.input;
 		if (!root) return;
 
-		const flavor: FilesApiFlavor = config.api ?? (isAnthropic ? "anthropic" : "openai");
+		const flavor = resolveFlavor(ctx, config, api);
 		let replacedInRequest = 0;
 		await rewriteImages(root, api, async (dataUri) => {
 			state.imagesSeen += 1;
@@ -836,8 +885,8 @@ function formatStatus(ctx: ExtensionContext, pi: ExtensionAPI): string {
 	const model = ctx.model;
 	if (!model) return "files-api: no active model";
 	const config = resolveConfig(pi, model);
-	const flavor: FilesApiFlavor = config.api ?? (model.api === ANTHROPIC_API ? "anthropic" : "openai");
-	const base = (config.baseUrl ?? model.baseUrl).replace(/\/+$/, "");
+	const flavor = resolveFlavor(ctx, config, model.api);
+	const base = uploadBaseUrl(ctx, config);
 	const endpoint = flavor === "anthropic" ? `${base}/v1/files` : `${base}/files`;
 	return [
 		`files-api: ${config.enabled ? "enabled" : "disabled"} (source: ${config.source})`,

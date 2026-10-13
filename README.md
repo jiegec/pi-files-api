@@ -18,9 +18,9 @@ The extension hooks `before_provider_request`, walks the outgoing payload, finds
 
 Supported APIs: `openai-completions`, `openai-responses`, and `anthropic-messages`. Inline `http(s)` image URLs are left untouched.
 
-The Files API flavor follows the request API: OpenAI-shaped (`POST <baseUrl>/files`) for `openai-*`, Anthropic-shaped (`POST <baseUrl>/v1/files`) for `anthropic-messages`. Override it with the `api` option. When an Anthropic payload is rewritten, `files-api-2025-04-14` is added to the `anthropic-beta` header, which the Messages API requires when referencing a Files API id.
+The Files API flavor follows the request API: OpenAI-shaped (`POST <baseUrl>/files`) for `openai-*`, Anthropic-shaped (`POST <baseUrl>/v1/files`) for `anthropic-messages`. With `authProvider` the upload borrows that provider's endpoint and credentials, so the flavor follows **that** provider's API instead — for example an `anthropic-messages` request to one gateway can upload through DeepSeek's OpenAI-shaped Files API. Override it explicitly with the `api` option. When an Anthropic payload is rewritten, `files-api-2025-04-14` is added to the `anthropic-beta` header, which the Messages API requires when referencing a Files API id.
 
-Uploads are deduplicated by a SHA-256 hash of the image bytes (in memory and, optionally, on disk) and by endpoint, so the same image is uploaded once per session at most. The `file_id` is stable across turns, which keeps prompt prefixes stable.
+Uploads are deduplicated by a SHA-256 hash of the image bytes (in memory and, optionally, on disk) and by endpoint, flavor, and credentials, so the same image is uploaded once per session at most. The `file_id` is stable across turns, which keeps prompt prefixes stable.
 
 ## Install / run
 
@@ -76,8 +76,8 @@ A `filesApi` entry can be placed on the provider, on a specific model, or in `mo
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `enabled` | boolean | `true` when the entry exists | Enable the rewrite. |
-| `baseUrl` | string | active model's `baseUrl` | Files API base: endpoint `<baseUrl>/files` (openai) or `<baseUrl>/v1/files` (anthropic). |
-| `api` | `"openai"` \| `"anthropic"` | from the request API | Files API flavor and upload shape. |
+| `baseUrl` | string | the `authProvider`'s base URL when set, else the active model's `baseUrl` | Files API base: endpoint `<baseUrl>/files` (openai) or `<baseUrl>/v1/files` (anthropic). |
+| `api` | `"openai"` \| `"anthropic"` | the `authProvider`'s API when set, else the request API | Files API flavor and upload shape. |
 | `authProvider` | string | — | Use **another provider's** credentials: API key and headers, plus that provider's base URL unless `baseUrl` is set. |
 | `apiKey` | string | — | Override just the API key. Literal, `$ENV_VAR`, or `${ENV_VAR}`. Replaces any inherited auth header. |
 | `purpose` | string | `user_data` (`vision` for provider `openai`) | Multipart `purpose` field (openai flavor only). |

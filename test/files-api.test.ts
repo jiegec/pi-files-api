@@ -429,6 +429,90 @@ test("authProvider uses another provider's credentials and base URL", async (t) 
 	assert.equal(h.calls[0].headers["x-extra"], "1");
 });
 
+test("authProvider derives the Files API flavor from the auth provider's API", async (t) => {
+	const h = await harness(t, {
+		modelsJson: {
+			providers: {
+				"test-provider": {
+					baseUrl: "https://axonhub.example/anthropic",
+					api: "anthropic-messages",
+					apiKey: "k",
+					filesApi: { enabled: true, authProvider: "deepseek" },
+					models: [{ id: "vision", input: ["text", "image"] }],
+				},
+				deepseek: { api: "openai-completions", baseUrl: "https://api.deepseek.com" },
+			},
+		},
+		model: { api: "anthropic-messages", baseUrl: "https://axonhub.example/anthropic" },
+		providerAuth: { deepseek: { auth: { apiKey: "ds-key" } } },
+		providers: { deepseek: { baseUrl: "https://api.deepseek.com" } },
+	});
+	h.setFetch(async () => fileResponse("file_ds"));
+	const payload = anthropicPayload(Buffer.from("img").toString("base64"));
+	await h.emit(payload);
+
+	// The request stays Anthropic-shaped, but the upload follows DeepSeek's OpenAI shape.
+	assert.deepEqual(payload.messages[0].content[1], {
+		type: "image",
+		source: { type: "file", file_id: "file_ds" },
+	});
+	assert.deepEqual(payload.betas, ["files-api-2025-04-14"]);
+	const call = h.calls[0];
+	assert.equal(call.url, "https://api.deepseek.com/files");
+	assert.equal(call.headers.Authorization, "Bearer ds-key");
+	assert.equal(call.headers["x-api-key"], undefined);
+	assert.equal(formValue(call, "purpose"), "user_data");
+});
+
+test("authProvider flavor falls back to the registry catalog's API", async (t) => {
+	const h = await harness(t, {
+		modelsJson: {
+			providers: {
+				"test-provider": {
+					baseUrl: "https://axonhub.example/anthropic",
+					api: "anthropic-messages",
+					apiKey: "k",
+					filesApi: { enabled: true, authProvider: "deepseek" },
+					models: [{ id: "vision", input: ["text", "image"] }],
+				},
+			},
+		},
+		model: { api: "anthropic-messages", baseUrl: "https://axonhub.example/anthropic" },
+		providerAuth: { deepseek: { auth: { apiKey: "ds-key" } } },
+		providers: {
+			deepseek: { baseUrl: "https://api.deepseek.com", getModels: () => [{ api: "openai-completions" }] },
+		},
+	});
+	h.setFetch(async () => fileResponse("file_reg"));
+	await h.emit(anthropicPayload(Buffer.from("img").toString("base64")));
+	assert.equal(h.calls[0].url, "https://api.deepseek.com/files");
+	assert.equal(h.calls[0].headers.Authorization, "Bearer ds-key");
+});
+
+test("explicit filesApi.api wins over the authProvider flavor", async (t) => {
+	const h = await harness(t, {
+		modelsJson: {
+			providers: {
+				"test-provider": {
+					baseUrl: "https://axonhub.example/anthropic",
+					api: "anthropic-messages",
+					apiKey: "k",
+					filesApi: { enabled: true, api: "anthropic", authProvider: "deepseek" },
+					models: [{ id: "vision", input: ["text", "image"] }],
+				},
+				deepseek: { api: "openai-completions" },
+			},
+		},
+		model: { api: "anthropic-messages", baseUrl: "https://axonhub.example/anthropic" },
+		providerAuth: { deepseek: { auth: { apiKey: "ds-key" } } },
+		providers: { deepseek: { baseUrl: "https://api.deepseek.com" } },
+	});
+	h.setFetch(async () => fileResponse("file_anth"));
+	await h.emit(anthropicPayload(Buffer.from("img").toString("base64")));
+	assert.equal(h.calls[0].url, "https://api.deepseek.com/v1/files");
+	assert.equal(h.calls[0].headers["x-api-key"], "ds-key");
+});
+
 test("apiKey override expands environment variables", async (t) => {
 	process.env.FILES_API_TEST_KEY = "secret-key";
 	t.after(() => delete process.env.FILES_API_TEST_KEY);
@@ -705,7 +789,7 @@ test("/files-api reports status and stats", async (t) => {
 	await h.emit(completionsPayload(png("a")));
 	const output = await h.command("");
 	assert.match(output, /files-api: enabled \(source: models\.json\)/);
-	assert.match(output, /files api: openai \(https:\/\/gateway\.example\/v1\/files\)/);
+	assert.match(output, /files api: openai \(https:\/\/files\.example\.com\/files\)/);
 	assert.match(output, /auth: provider:other/);
 	assert.match(output, /uploads: 1/);
 });
