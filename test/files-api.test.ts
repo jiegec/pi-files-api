@@ -121,12 +121,19 @@ async function harness(t: test.TestContext, options: HarnessOptions = {}) {
 		baseUrl: "https://gateway.example/v1",
 		...(options.model ?? {}),
 	};
+	const authCalls = { self: 0, provider: 0 };
 	const ctx = {
 		mode: options.mode ?? "tui",
 		model,
 		modelRegistry: {
-			getApiKeyAndHeaders: async () => options.selfAuth ?? { ok: true, apiKey: "self-key", headers: {} },
-			getProviderAuth: async (provider: string) => (options.providerAuth ?? {})[provider],
+			getApiKeyAndHeaders: async () => {
+				authCalls.self += 1;
+				return options.selfAuth ?? { ok: true, apiKey: "self-key", headers: {} };
+			},
+			getProviderAuth: async (provider: string) => {
+				authCalls.provider += 1;
+				return (options.providerAuth ?? {})[provider];
+			},
 			getProvider: (provider: string) => (options.providers ?? {})[provider],
 		},
 		signal: undefined,
@@ -148,6 +155,7 @@ async function harness(t: test.TestContext, options: HarnessOptions = {}) {
 		model,
 		notifications,
 		entries,
+		authCalls,
 		get calls() {
 			return calls;
 		},
@@ -450,6 +458,25 @@ test("authProvider uses another provider's credentials and base URL", async (t) 
 	assert.equal(h.calls[0].url, "https://files.example.com/files");
 	assert.equal(h.calls[0].headers.Authorization, "Bearer other-key");
 	assert.equal(h.calls[0].headers["x-extra"], "1");
+});
+
+test("resolves provider auth once per request for several images", async (t) => {
+	const h = await harness(t, { modelsJson: providerConfig(true) });
+	h.setFetch(async () => fileResponse("file-multi"));
+	await h.emit({
+		model: "m",
+		messages: [
+			{
+				role: "user",
+				content: [
+					{ type: "image_url", image_url: { url: png("a") } },
+					{ type: "image_url", image_url: { url: png("b") } },
+				],
+			},
+		],
+	});
+	assert.equal(h.calls.length, 2);
+	assert.deepEqual(h.authCalls, { self: 1, provider: 0 });
 });
 
 test("authProvider derives the Files API flavor from the auth provider's API", async (t) => {

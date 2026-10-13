@@ -26,7 +26,7 @@
  *         "filesApi": {                       // opt-in switch (provider, model, or modelOverrides)
  *           "enabled": true,
  *           "baseUrl": "https://api.deepseek.com", // optional endpoint override
- *           "api": "openai",                   // optional "openai" | "anthropic" flavor (default: authProvider's api, else the request api)
+ *           "api": "openai",                  // optional "openai" | "anthropic" flavor (default: authProvider's api, else the request api)
  *           "authProvider": "deepseek",       // optional: use another provider's credentials
  *           "apiKey": "$MY_FILES_KEY",        // optional literal/env API key override
  *           "purpose": "user_data",           // optional (default: user_data, vision for "openai")
@@ -334,10 +334,8 @@ function resolveConfig(pi: ExtensionAPI, model: { provider: string; id: string; 
 }
 
 // ---------------------------------------------------------------------------
-// Persistent hash -> file_id cache
+// Tool-result file names
 // ---------------------------------------------------------------------------
-
-let fileCache: CacheFile | undefined;
 
 /**
  * Tool call id -> source file name, learned from tool results. Lets us label an
@@ -353,6 +351,12 @@ function normalizeToolCallId(id: string): string {
 		.slice(0, 64)
 		.replace(/_+$/, "");
 }
+
+// ---------------------------------------------------------------------------
+// Persistent hash -> file_id cache
+// ---------------------------------------------------------------------------
+
+let fileCache: CacheFile | undefined;
 
 function cachePath(): string {
 	return join(getAgentDir(), CACHE_FILE);
@@ -519,14 +523,17 @@ interface UploadResult {
 	expiresAt?: string;
 }
 
-async function uploadToFilesApi(
-	image: DataUriImage,
-	hash: string,
-	ctx: ExtensionContext,
-	config: ResolvedConfig,
-	flavor: FilesApiFlavor,
-	name?: string,
-): Promise<UploadResult> {
+/** Credentials and base URL used for an upload. */
+interface UploadAuth {
+	apiKey?: string;
+	headers: Record<string, string>;
+	baseUrl?: string;
+}
+
+/** Resolved config -> auth, so a request with several images resolves auth once. */
+const uploadAuthCache = new WeakMap<ResolvedConfig, Promise<UploadAuth>>();
+
+async function computeUploadAuth(ctx: ExtensionContext, config: ResolvedConfig): Promise<UploadAuth> {
 	const model = ctx.model;
 	if (!model) throw new Error("no active model");
 
@@ -540,10 +547,7 @@ async function uploadToFilesApi(
 		if (!authResult) throw new Error(`no credentials found for auth provider "${config.authProvider}"`);
 		apiKey = authResult.auth.apiKey;
 		rawHeaders = authResult.auth.headers ?? {};
-		baseUrl =
-			config.baseUrl ??
-			authResult.auth.baseUrl ??
-			uploadBaseUrl(ctx, config);
+		baseUrl = config.baseUrl ?? authResult.auth.baseUrl ?? uploadBaseUrl(ctx, config);
 	} else {
 		const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
 		if (!auth.ok) throw new Error(auth.error);
@@ -565,6 +569,31 @@ async function uploadToFilesApi(
 			if (lower === "authorization" || lower === "x-api-key" || lower === "api-key") delete headers[key];
 		}
 	}
+	return { apiKey, headers, baseUrl };
+}
+
+/** Memoized per request: `resolveConfig` returns a fresh object, so the WeakMap entry expires with it. */
+function resolveUploadAuth(ctx: ExtensionContext, config: ResolvedConfig): Promise<UploadAuth> {
+	let auth = uploadAuthCache.get(config);
+	if (!auth) {
+		auth = computeUploadAuth(ctx, config);
+		uploadAuthCache.set(config, auth);
+	}
+	return auth;
+}
+
+async function uploadToFilesApi(
+	image: DataUriImage,
+	hash: string,
+	ctx: ExtensionContext,
+	config: ResolvedConfig,
+	flavor: FilesApiFlavor,
+	name?: string,
+): Promise<UploadResult> {
+	const model = ctx.model;
+	if (!model) throw new Error("no active model");
+
+	const { apiKey, headers, baseUrl } = await resolveUploadAuth(ctx, config);
 	const base = (baseUrl ?? model.baseUrl).replace(/\/+$/, "");
 	const form = new FormData();
 	form.append(
@@ -758,7 +787,10 @@ async function rewriteImages(
 	let childToolCallId = toolCallId;
 	if (record.type === "tool_result" && typeof record.tool_use_id === "string") {
 		childToolCallId = record.tool_use_id;
-	} else if (record.type === "function_call_output" && typeof record.call_id === "string") {
+	} else if (
+		(record.type === "function_call_output" || record.type === "custom_tool_call_output") &&
+		typeof record.call_id === "string"
+	) {
 		childToolCallId = record.call_id;
 	}
 
@@ -926,6 +958,7 @@ export default function (pi: ExtensionAPI) {
 				const removed = Object.keys(diskEntries).length + memoryOnly;
 				state = newState();
 				fileCache = { version: CACHE_VERSION, entries: {} };
+				toolResultNames.clear();
 				saveFileCache();
 				ctx.ui.notify(
 					`files-api cache cleared (${removed} file_id record${removed === 1 ? "" : "s"})`,
