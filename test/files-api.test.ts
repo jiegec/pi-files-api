@@ -95,6 +95,8 @@ async function harness(t: test.TestContext, options: HarnessOptions = {}) {
 	const commands: Record<string, any> = {};
 	const flags = { ...(options.flags ?? {}) };
 	const notifications: Array<{ message: string; type: string | undefined }> = [];
+	const entries: Array<{ customType: string; data: any }> = [];
+	const entryRenderers: Record<string, any> = {};
 	const pi = {
 		on: (event: string, handler: (...args: any[]) => any) => {
 			(handlers[event] ??= []).push(handler);
@@ -103,6 +105,12 @@ async function harness(t: test.TestContext, options: HarnessOptions = {}) {
 		getFlag: (name: string) => flags[name],
 		registerCommand: (name: string, definition: any) => {
 			commands[name] = definition;
+		},
+		registerEntryRenderer: (customType: string, renderer: any) => {
+			entryRenderers[customType] = renderer;
+		},
+		appendEntry: (customType: string, data?: any) => {
+			entries.push({ customType, data });
 		},
 	};
 
@@ -139,6 +147,7 @@ async function harness(t: test.TestContext, options: HarnessOptions = {}) {
 		ctx,
 		model,
 		notifications,
+		entries,
 		get calls() {
 			return calls;
 		},
@@ -148,6 +157,12 @@ async function harness(t: test.TestContext, options: HarnessOptions = {}) {
 		},
 		setFetch: (impl: (url: string, init: any) => Promise<Response>) => {
 			fetchImpl = impl;
+		},
+		renderEntry(customType: string, data: any): string {
+			const renderer = entryRenderers[customType];
+			const theme = { fg: (_color: string, text: string) => text };
+			const component = renderer({ data }, { expanded: false }, theme);
+			return component.render(80).join("\n");
 		},
 		async emit(payload: any) {
 			let current = payload;
@@ -721,13 +736,18 @@ test("logs an upload and a later reuse of the same image", async (t) => {
 	const h = await harness(t, { modelsJson: providerConfig(true) });
 	h.setFetch(async () => fileResponse("file-log"));
 	await h.emit(completionsPayload(png("a")));
-	assert.equal(h.notifications.length, 1);
-	assert.match(h.notifications[0].message, /uploaded .*file-log/);
+	const upload = h.entries.find((entry) => entry.customType === "files-api-log");
+	assert.ok(upload, JSON.stringify(h.entries));
+	assert.equal(upload!.data.id, "file-log");
+	assert.match(upload!.data.detail, /^uploaded \(/);
+	// Nothing pops up; it is printed in the transcript instead.
+	assert.equal(h.notifications.length, 0);
+	assert.match(h.renderEntry("files-api-log", upload!.data), /files-api: uploaded .* file-log/);
 
-	h.notifications.length = 0;
+	h.entries.length = 0;
 	await h.emit(completionsPayload(png("a")));
-	assert.equal(h.notifications.length, 1);
-	assert.match(h.notifications[0].message, /reused file-log/);
+	assert.equal(h.entries.length, 1);
+	assert.deepEqual(h.entries[0].data, { detail: "reused", id: "file-log" });
 });
 
 test("logs each file id once per request when it is referenced repeatedly", async (t) => {
@@ -746,8 +766,9 @@ test("logs each file id once per request when it is referenced repeatedly", asyn
 		],
 	};
 	await h.emit(payload);
-	assert.equal(h.notifications.length, 1);
-	assert.match(h.notifications[0].message, /uploaded .*file-dup/);
+	assert.equal(h.entries.length, 1);
+	assert.equal(h.entries[0].data.id, "file-dup");
+	assert.match(h.entries[0].data.detail, /^uploaded/);
 });
 
 test("logs to stderr outside the TUI", async (t) => {
@@ -763,6 +784,7 @@ test("logs to stderr outside the TUI", async (t) => {
 	h.setFetch(async () => fileResponse("file-print"));
 	await h.emit(completionsPayload(png("a")));
 	assert.ok(lines.some((line) => line.includes("uploaded") && line.includes("file-print")));
+	assert.equal(h.entries.length, 0);
 });
 
 // ---------------------------------------------------------------------------
