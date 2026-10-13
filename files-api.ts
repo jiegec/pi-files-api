@@ -47,11 +47,10 @@
  * OpenAI-shaped Files API; `apiKey` overrides just the key (a literal or
  * `$ENV_VAR` / `${ENV_VAR}`).
  *
- * Each resolved image is logged as a dim line in the transcript (a custom entry,
- * not sent to the model; stderr outside the TUI): `uploaded (<size>) <file_id>`
- * for a fresh upload, `reused <file_id>` for a memory/disk cache hit. Each file
- * id is logged once per session, when it first enters the conversation. It is not
- * a popup notification.
+ * Each upload is logged as a dim line in the transcript (a custom entry, not sent
+ * to the model; stderr outside the TUI): `uploaded [<name>] (<size>) <file_id>`.
+ * Reuses stay silent; a failure is reported as a warning. For images read through
+ * a tool (e.g. `read`), the source file name is appended when known.
  *
  * Usage:
  *   npx @earendil-works/pi-coding-agent --extension ./files-api.ts
@@ -59,7 +58,7 @@
 
 import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 /** Default lifetime for uploaded files (7 days). */
@@ -79,11 +78,11 @@ const ANTHROPIC_MAX_EXPIRES_SECONDS = 7_776_000;
 /** Files API flavor: OpenAI-shaped (`/files`) or Anthropic-shaped (`/v1/files`). */
 type FilesApiFlavor = "openai" | "anthropic";
 
-/** Custom session entry type for the per-image resolution log. */
+/** Custom session entry type for the per-image upload log. */
 const LOG_ENTRY_TYPE = "files-api-log";
 
-/** Report how one image block was resolved (`detail` is e.g. `reused`). */
-type LogResolution = (id: string, detail: string) => void;
+/** Report an image upload (`name` is the source file, when known). */
+type UploadLogger = (info: { id: string; name?: string; bytes: number }) => void;
 
 interface FilesApiEntryConfig {
 	enabled?: boolean;
@@ -158,8 +157,6 @@ interface RuntimeState {
 	failureCounts: Map<string, number>;
 	/** Endpoint -> epoch ms until which uploads are skipped. */
 	backoffUntil: Map<string, number>;
-	/** File ids already logged this session, so a replayed image is not logged again. */
-	logged: Set<string>;
 }
 
 function newState(): RuntimeState {
@@ -179,7 +176,6 @@ function newState(): RuntimeState {
 		inflight: new Map(),
 		failureCounts: new Map(),
 		backoffUntil: new Map(),
-		logged: new Set(),
 	};
 }
 
@@ -340,6 +336,12 @@ function resolveConfig(pi: ExtensionAPI, model: { provider: string; id: string; 
 // ---------------------------------------------------------------------------
 
 let fileCache: CacheFile | undefined;
+
+/**
+ * SHA-256 of image bytes -> source file name, learned from tool results (the
+ * `read` tool carries the path). Used to label uploads; cleared per session.
+ */
+const imageNames = new Map<string, string>();
 
 function cachePath(): string {
 	return join(getAgentDir(), CACHE_FILE);
@@ -512,6 +514,7 @@ async function uploadToFilesApi(
 	ctx: ExtensionContext,
 	config: ResolvedConfig,
 	flavor: FilesApiFlavor,
+	name?: string,
 ): Promise<UploadResult> {
 	const model = ctx.model;
 	if (!model) throw new Error("no active model");
@@ -556,7 +559,7 @@ async function uploadToFilesApi(
 	form.append(
 		"file",
 		new Blob([new Uint8Array(image.bytes)], { type: image.mimeType }),
-		`image-${hash.slice(0, 12)}.${extensionFor(image.mimeType)}`,
+		name ?? `image-${hash.slice(0, 12)}.${extensionFor(image.mimeType)}`,
 	);
 
 	// Both flavors expire files at upload time, but with different form fields and
@@ -621,7 +624,7 @@ async function uploadImage(
 	config: ResolvedConfig,
 	state: RuntimeState,
 	flavor: FilesApiFlavor,
-	log: LogResolution,
+	log: UploadLogger,
 ): Promise<string | undefined> {
 	const image = parseDataUri(dataUri);
 	if (!image || !image.mimeType.startsWith("image/") || image.bytes.length === 0) return undefined;
@@ -639,7 +642,6 @@ async function uploadImage(
 	if (inMemory) {
 		if (!isExpired(inMemory)) {
 			state.cacheHits += 1;
-			log(inMemory.id, "reused");
 			return inMemory.id;
 		}
 		// Expired: drop it from memory and disk, then re-upload below.
@@ -653,7 +655,6 @@ async function uploadImage(
 			if (!isExpired(cached)) {
 				state.memory.set(key, { id: cached.id, expiresAt: cached.expiresAt });
 				state.cacheHits += 1;
-				log(cached.id, "reused");
 				return cached.id;
 			}
 			dropDiskEntry(key);
@@ -672,7 +673,8 @@ async function uploadImage(
 	const inflight = state.inflight.get(key);
 	if (inflight) return inflight;
 
-	const promise = uploadToFilesApi(image, hash, ctx, config, flavor)
+	const name = imageNames.get(hash);
+	const promise = uploadToFilesApi(image, hash, ctx, config, flavor, name)
 		.then(({ id, expiresAt }) => {
 			state.memory.set(key, { id, expiresAt });
 			state.uploaded += 1;
@@ -681,7 +683,7 @@ async function uploadImage(
 			state.lastFileId = id;
 			state.failureCounts.delete(scopeKey);
 			state.backoffUntil.delete(scopeKey);
-			log(id, `uploaded (${formatBytes(image.bytes.length)})`);
+			log({ id, name, bytes: image.bytes.length });
 			if (config.cache) {
 				loadFileCache().entries[key] = {
 					id,
@@ -821,6 +823,25 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", () => {
 		state = newState();
 		fileCache = undefined;
+		imageNames.clear();
+	});
+
+	// Learn source file names from tool results (the `read` tool carries the
+	// path), keyed by image bytes so we can label the matching upload.
+	pi.on("tool_result", (event) => {
+		const input = event.input as Record<string, unknown>;
+		const path = [input.path, input.file_path, input.filePath, input.filename, input.file].find(
+			(value): value is string => typeof value === "string" && value.length > 0,
+		);
+		if (!path) return;
+		const name = basename(path);
+		for (const block of event.content) {
+			if (block.type !== "image") continue;
+			const hash = createHash("sha256").update(Buffer.from(block.data, "base64")).digest("hex");
+			// Keyed by content, so identical bytes from different files share an entry;
+			// keep the first name we see for a stable label.
+			if (!imageNames.has(hash)) imageNames.set(hash, name);
+		}
 	});
 
 	pi.on("before_provider_request", async (event, ctx) => {
@@ -844,18 +865,17 @@ export default function (pi: ExtensionAPI) {
 
 		const flavor = resolveFlavor(ctx, config, api);
 		let replacedInRequest = 0;
-		// Report each image only once per session, at the request where it first
-		// enters the conversation, so historical images replayed on later turns do
-		// not keep appending lines under unrelated tool calls.
-		const log: LogResolution = (id, detail) => {
-			if (state.logged.has(id)) return;
-			state.logged.add(id);
+		// Print one line per actual upload (reuses stay silent), under the message
+		// being sent. Image blocks carry no file name, so read-tool uploads use the
+		// name learned from the tool result when available.
+		const logUpload: UploadLogger = ({ id, name, bytes }) => {
+			const detail = `uploaded${name ? ` ${name}` : ""} (${formatBytes(bytes)})`;
 			if (ctx.mode === "tui") pi.appendEntry(LOG_ENTRY_TYPE, { detail, id });
 			else console.error(`[files-api] ${detail} ${id}`);
 		};
 		await rewriteImages(root, api, async (dataUri) => {
 			state.imagesSeen += 1;
-			const id = await uploadImage(dataUri, ctx, config, state, flavor, log);
+			const id = await uploadImage(dataUri, ctx, config, state, flavor, logUpload);
 			if (id) {
 				state.transformed += 1;
 				replacedInRequest += 1;

@@ -172,6 +172,14 @@ async function harness(t: test.TestContext, options: HarnessOptions = {}) {
 			}
 			return current;
 		},
+		async emitToolResult(content: any[], input: Record<string, unknown> = {}) {
+			for (const handler of handlers["tool_result"] ?? []) {
+				await handler(
+					{ type: "tool_result", toolName: "read", toolCallId: "call-1", input, content, isError: false },
+					ctx,
+				);
+			}
+		},
 		async command(args = "") {
 			notifications.length = 0;
 			await commands["files-api"].handler(args, ctx);
@@ -742,16 +750,16 @@ test("logs an image once and stays quiet on later requests", async (t) => {
 	assert.match(upload!.data.detail, /^uploaded \(/);
 	// Nothing pops up; it is printed in the transcript instead.
 	assert.equal(h.notifications.length, 0);
-	assert.match(h.renderEntry("files-api-log", upload!.data), /files-api: uploaded .* file-log/);
+	assert.match(h.renderEntry("files-api-log", upload!.data), /files-api: uploaded \(.*\) file-log/);
 
-	// Replaying the same image on later requests must not append more lines.
+	// Replaying the same image on later requests reuses the file id silently.
 	await h.emit(completionsPayload(png("a")));
 	await h.emit(completionsPayload(png("a")));
 	assert.equal(h.entries.length, 1);
 	assert.equal(h.notifications.length, 0);
 });
 
-test("logs a reuse once when an image comes from the on-disk cache", async (t) => {
+test("reusing an image from the on-disk cache is not logged", async (t) => {
 	const agentDir = mkdtempSync(join(tmpdir(), "pi-files-api-log-cache-"));
 	t.after(() => rmSync(agentDir, { recursive: true, force: true }));
 	const modelsJson = providerConfig(true);
@@ -766,12 +774,26 @@ test("logs a reuse once when an image comes from the on-disk cache", async (t) =
 		throw new Error("should not upload");
 	});
 	await second.emit(completionsPayload(png("a")));
-	assert.equal(second.entries.length, 1);
-	assert.deepEqual(second.entries[0].data, { detail: "reused", id: "file-persist-log" });
+	assert.equal(second.entries.length, 0);
+	assert.match(await second.command("stats"), /cache hits: 1/);
+});
 
-	// A later request in the same session reuses it silently.
-	await second.emit(completionsPayload(png("a")));
-	assert.equal(second.entries.length, 1);
+test("logs the source file name for images from the read tool", async (t) => {
+	const h = await harness(t, { modelsJson: providerConfig(true) });
+	h.setFetch(async () => fileResponse("file-named"));
+	const dataUri = png("photo");
+	const base64 = dataUri.slice(dataUri.indexOf(",") + 1);
+	await h.emitToolResult([{ type: "image", data: base64, mimeType: "image/png" }], {
+		path: "/tmp/pictures/cat.png",
+	});
+	await h.emit(completionsPayload(dataUri));
+
+	assert.equal(h.entries.length, 1);
+	assert.equal(h.entries[0].data.id, "file-named");
+	assert.match(h.entries[0].data.detail, /^uploaded cat\.png \(/);
+	assert.match(h.renderEntry("files-api-log", h.entries[0].data), /files-api: uploaded cat\.png \(.*\) file-named/);
+	const file = formValue(h.calls[0], "file") as { name: string };
+	assert.equal(file.name, "cat.png");
 });
 
 test("logs an image once even when it is referenced repeatedly in one request", async (t) => {
