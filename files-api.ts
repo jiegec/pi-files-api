@@ -47,6 +47,10 @@
  * OpenAI-shaped Files API; `apiKey` overrides just the key (a literal or
  * `$ENV_VAR` / `${ENV_VAR}`).
  *
+ * Each resolved image is logged (TUI notification, or stderr outside the TUI):
+ * `uploaded (<size>) <file_id>` for a fresh upload, `reused <file_id>` for a
+ * memory/disk cache hit (once per file id per request).
+ *
  * Usage:
  *   npx @earendil-works/pi-coding-agent --extension ./files-api.ts
  */
@@ -435,6 +439,17 @@ function formatError(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }
 
+/**
+ * Report how an image block was resolved. Logged once per file id per request, so
+ * a payload that references the same image several times logs a single line.
+ */
+function logResolution(ctx: ExtensionContext, logged: Set<string>, id: string, detail: string): void {
+	if (logged.has(id)) return;
+	logged.add(id);
+	if (ctx.mode === "tui") ctx.ui.notify(`files-api: ${detail} ${id}`, "info");
+	else console.error(`[files-api] ${detail} ${id}`);
+}
+
 /** Append a beta feature to an `anthropic-beta` header value. */
 function addBetaHeader(headers: Record<string, string>, beta: string): void {
 	const key = Object.keys(headers).find((name) => name.toLowerCase() === "anthropic-beta");
@@ -606,6 +621,7 @@ async function uploadImage(
 	config: ResolvedConfig,
 	state: RuntimeState,
 	flavor: FilesApiFlavor,
+	logged: Set<string>,
 ): Promise<string | undefined> {
 	const image = parseDataUri(dataUri);
 	if (!image || !image.mimeType.startsWith("image/") || image.bytes.length === 0) return undefined;
@@ -623,6 +639,7 @@ async function uploadImage(
 	if (inMemory) {
 		if (!isExpired(inMemory)) {
 			state.cacheHits += 1;
+			logResolution(ctx, logged, inMemory.id, "reused");
 			return inMemory.id;
 		}
 		// Expired: drop it from memory and disk, then re-upload below.
@@ -636,6 +653,7 @@ async function uploadImage(
 			if (!isExpired(cached)) {
 				state.memory.set(key, { id: cached.id, expiresAt: cached.expiresAt });
 				state.cacheHits += 1;
+				logResolution(ctx, logged, cached.id, "reused");
 				return cached.id;
 			}
 			dropDiskEntry(key);
@@ -663,6 +681,7 @@ async function uploadImage(
 			state.lastFileId = id;
 			state.failureCounts.delete(scopeKey);
 			state.backoffUntil.delete(scopeKey);
+			logResolution(ctx, logged, id, `uploaded (${formatBytes(image.bytes.length)})`);
 			if (config.cache) {
 				loadFileCache().entries[key] = {
 					id,
@@ -813,9 +832,10 @@ export default function (pi: ExtensionAPI) {
 
 		const flavor = resolveFlavor(ctx, config, api);
 		let replacedInRequest = 0;
+		const logged = new Set<string>();
 		await rewriteImages(root, api, async (dataUri) => {
 			state.imagesSeen += 1;
-			const id = await uploadImage(dataUri, ctx, config, state, flavor);
+			const id = await uploadImage(dataUri, ctx, config, state, flavor, logged);
 			if (id) {
 				state.transformed += 1;
 				replacedInRequest += 1;

@@ -714,6 +714,58 @@ test("file_id cache persists to disk across instances", async (t) => {
 });
 
 // ---------------------------------------------------------------------------
+// logging
+// ---------------------------------------------------------------------------
+
+test("logs an upload and a later reuse of the same image", async (t) => {
+	const h = await harness(t, { modelsJson: providerConfig(true) });
+	h.setFetch(async () => fileResponse("file-log"));
+	await h.emit(completionsPayload(png("a")));
+	assert.equal(h.notifications.length, 1);
+	assert.match(h.notifications[0].message, /uploaded .*file-log/);
+
+	h.notifications.length = 0;
+	await h.emit(completionsPayload(png("a")));
+	assert.equal(h.notifications.length, 1);
+	assert.match(h.notifications[0].message, /reused file-log/);
+});
+
+test("logs each file id once per request when it is referenced repeatedly", async (t) => {
+	const h = await harness(t, { modelsJson: providerConfig(true) });
+	h.setFetch(async () => fileResponse("file-dup"));
+	const payload = {
+		model: "m",
+		messages: [
+			{
+				role: "user",
+				content: [
+					{ type: "image_url", image_url: { url: png("same") } },
+					{ type: "image_url", image_url: { url: png("same") } },
+				],
+			},
+		],
+	};
+	await h.emit(payload);
+	assert.equal(h.notifications.length, 1);
+	assert.match(h.notifications[0].message, /uploaded .*file-dup/);
+});
+
+test("logs to stderr outside the TUI", async (t) => {
+	const h = await harness(t, { modelsJson: providerConfig(true), mode: "print" });
+	const lines: string[] = [];
+	const original = console.error;
+	console.error = (message?: unknown) => {
+		lines.push(String(message));
+	};
+	t.after(() => {
+		console.error = original;
+	});
+	h.setFetch(async () => fileResponse("file-print"));
+	await h.emit(completionsPayload(png("a")));
+	assert.ok(lines.some((line) => line.includes("uploaded") && line.includes("file-print")));
+});
+
+// ---------------------------------------------------------------------------
 // failures and backoff
 // ---------------------------------------------------------------------------
 

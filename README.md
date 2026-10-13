@@ -138,6 +138,7 @@ Statistics include images seen, blocks transformed, uploads (count and bytes), c
 
 ## Behavior and safety
 
+- **Logging:** each image block is reported as it is resolved — `uploaded (<size>) <file_id>` for a fresh upload, `reused <file_id>` for a memory/disk cache hit — as a TUI notification, or on stderr outside the TUI. A `file_id` referenced several times in one request logs once.
 - **Fallback:** if an upload fails, the inline image is kept so the request still has a chance to succeed. Failures are surfaced via a TUI warning (or stderr outside the TUI) and recorded for `/files-api`.
 - **Backoff:** after 3 consecutive failures for an endpoint, further uploads to it are skipped for 5 minutes to avoid a failed round trip on every turn. Reset with `/files-api retry`.
 - **Cache:** stored as `files-api-cache.json` in the agent directory, keyed by endpoint + credentials. Each entry remembers its expiry as an RFC 3339 UTC timestamp (the server's `expires_at`, otherwise the configured lifetime); expired entries are ignored and dropped, and the image is uploaded again next time. Clear it with `/files-api clear`.
