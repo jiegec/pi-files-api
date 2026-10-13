@@ -858,8 +858,14 @@ export default function (pi: ExtensionAPI) {
 		if (!path) return;
 		if (!event.content.some((block) => block.type === "image")) return;
 		const name = basename(path);
-		toolResultNames.set(event.toolCallId, name);
-		toolResultNames.set(normalizeToolCallId(event.toolCallId), name);
+		// OpenAI Responses ids are composite (`<call_id>|<item_id>`); the payload
+		// only carries the `<call_id>` part, so index both it and the full id.
+		const ids = new Set([event.toolCallId, event.toolCallId.split("|")[0]]);
+		for (const id of ids) {
+			if (!id) continue;
+			toolResultNames.set(id, name);
+			toolResultNames.set(normalizeToolCallId(id), name);
+		}
 	});
 
 	pi.on("before_provider_request", async (event, ctx) => {

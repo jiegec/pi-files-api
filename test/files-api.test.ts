@@ -874,7 +874,9 @@ test("maps an image to its function call output in openai-responses", async (t) 
 	h.setFetch(async () => fileResponse("file-fc"));
 	const dataUri = png("resp");
 	const base64 = dataUri.slice(dataUri.indexOf(",") + 1);
-	await h.emitToolResult([{ type: "image", data: base64, mimeType: "image/png" }], { path: "/a/plot.png" }, "call_x");
+	// Responses tool call ids are composite on the transcript, but the payload
+	// only keeps the part before `|`.
+	await h.emitToolResult([{ type: "image", data: base64, mimeType: "image/png" }], { path: "/a/plot.png" }, "call_x|fc_abc");
 	await h.emit({
 		model: "m",
 		input: [
