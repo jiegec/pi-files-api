@@ -49,8 +49,10 @@
  *
  * Each upload is logged as a dim line in the transcript (a custom entry, not sent
  * to the model; stderr outside the TUI): `uploaded [<name>] (<size>) <file_id>`.
- * Reuses stay silent; a failure is reported as a warning. For images read through
- * a tool (e.g. `read`), the source file name is appended when known.
+ * Reuses stay silent; a failure is reported as a warning. For images inside a tool
+ * result (e.g. `read`), the name comes from the tool call id, so byte-identical
+ * files stay distinct; OpenAI Completions detaches those images, so they are
+ * uploaded without a name.
  *
  * Usage:
  *   npx @earendil-works/pi-coding-agent --extension ./files-api.ts
@@ -338,10 +340,19 @@ function resolveConfig(pi: ExtensionAPI, model: { provider: string; id: string; 
 let fileCache: CacheFile | undefined;
 
 /**
- * SHA-256 of image bytes -> source file name, learned from tool results (the
- * `read` tool carries the path). Used to label uploads; cleared per session.
+ * Tool call id -> source file name, learned from tool results. Lets us label an
+ * image by the exact tool call it came from, even when several files share the
+ * same bytes. Cleared per session.
  */
-const imageNames = new Map<string, string>();
+const toolResultNames = new Map<string, string>();
+
+/** Provider-normalized tool call id (Anthropic and OpenAI Responses sanitize ids). */
+function normalizeToolCallId(id: string): string {
+	return id
+		.replace(/[^a-zA-Z0-9_-]/g, "_")
+		.slice(0, 64)
+		.replace(/_+$/, "");
+}
 
 function cachePath(): string {
 	return join(getAgentDir(), CACHE_FILE);
@@ -625,6 +636,7 @@ async function uploadImage(
 	state: RuntimeState,
 	flavor: FilesApiFlavor,
 	log: UploadLogger,
+	toolCallId?: string,
 ): Promise<string | undefined> {
 	const image = parseDataUri(dataUri);
 	if (!image || !image.mimeType.startsWith("image/") || image.bytes.length === 0) return undefined;
@@ -673,7 +685,7 @@ async function uploadImage(
 	const inflight = state.inflight.get(key);
 	if (inflight) return inflight;
 
-	const name = imageNames.get(hash);
+	const name = toolCallId ? toolResultNames.get(toolCallId) : undefined;
 	const promise = uploadToFilesApi(image, hash, ctx, config, flavor, name)
 		.then(({ id, expiresAt }) => {
 			state.memory.set(key, { id, expiresAt });
@@ -730,15 +742,25 @@ async function uploadImage(
 async function rewriteImages(
 	node: unknown,
 	api: string,
-	upload: (dataUri: string) => Promise<string | undefined>,
+	upload: (dataUri: string, toolCallId?: string) => Promise<string | undefined>,
+	toolCallId?: string,
 ): Promise<void> {
 	if (Array.isArray(node)) {
-		for (const item of node) await rewriteImages(item, api, upload);
+		for (const item of node) await rewriteImages(item, api, upload, toolCallId);
 		return;
 	}
 	if (!node || typeof node !== "object") return;
 
 	const record = node as Record<string, any>;
+
+	// Thread the id of a tool-result container down to its images so the source
+	// file can be identified exactly, even for byte-identical files.
+	let childToolCallId = toolCallId;
+	if (record.type === "tool_result" && typeof record.tool_use_id === "string") {
+		childToolCallId = record.tool_use_id;
+	} else if (record.type === "function_call_output" && typeof record.call_id === "string") {
+		childToolCallId = record.call_id;
+	}
 
 	if (api === COMPLETIONS_API) {
 		if (
@@ -747,7 +769,7 @@ async function rewriteImages(
 			typeof record.image_url.url === "string" &&
 			record.image_url.url.startsWith("data:")
 		) {
-			const id = await upload(record.image_url.url);
+			const id = await upload(record.image_url.url, childToolCallId);
 			if (id) {
 				record.type = "file";
 				record.file_id = id;
@@ -767,7 +789,7 @@ async function rewriteImages(
 				typeof source.media_type === "string" && source.media_type.length > 0
 					? source.media_type
 					: "image/png";
-			const id = await upload(`data:${mimeType};base64,${source.data}`);
+			const id = await upload(`data:${mimeType};base64,${source.data}`, childToolCallId);
 			if (id) record.source = { type: "file", file_id: id };
 		}
 	} else if (
@@ -775,7 +797,7 @@ async function rewriteImages(
 		typeof record.image_url === "string" &&
 		record.image_url.startsWith("data:")
 	) {
-		const id = await upload(record.image_url);
+		const id = await upload(record.image_url, childToolCallId);
 		if (id) {
 			record.file_id = id;
 			delete record.image_url;
@@ -784,7 +806,7 @@ async function rewriteImages(
 	}
 
 	for (const value of Object.values(record)) {
-		await rewriteImages(value, api, upload);
+		await rewriteImages(value, api, upload, childToolCallId);
 	}
 }
 
@@ -823,25 +845,21 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", () => {
 		state = newState();
 		fileCache = undefined;
-		imageNames.clear();
+		toolResultNames.clear();
 	});
 
 	// Learn source file names from tool results (the `read` tool carries the
-	// path), keyed by image bytes so we can label the matching upload.
+	// path) and label the matching image by its tool call id.
 	pi.on("tool_result", (event) => {
 		const input = event.input as Record<string, unknown>;
 		const path = [input.path, input.file_path, input.filePath, input.filename, input.file].find(
 			(value): value is string => typeof value === "string" && value.length > 0,
 		);
 		if (!path) return;
+		if (!event.content.some((block) => block.type === "image")) return;
 		const name = basename(path);
-		for (const block of event.content) {
-			if (block.type !== "image") continue;
-			const hash = createHash("sha256").update(Buffer.from(block.data, "base64")).digest("hex");
-			// Keyed by content, so identical bytes from different files share an entry;
-			// keep the first name we see for a stable label.
-			if (!imageNames.has(hash)) imageNames.set(hash, name);
-		}
+		toolResultNames.set(event.toolCallId, name);
+		toolResultNames.set(normalizeToolCallId(event.toolCallId), name);
 	});
 
 	pi.on("before_provider_request", async (event, ctx) => {
@@ -873,9 +891,9 @@ export default function (pi: ExtensionAPI) {
 			if (ctx.mode === "tui") pi.appendEntry(LOG_ENTRY_TYPE, { detail, id });
 			else console.error(`[files-api] ${detail} ${id}`);
 		};
-		await rewriteImages(root, api, async (dataUri) => {
+		await rewriteImages(root, api, async (dataUri, toolCallId) => {
 			state.imagesSeen += 1;
-			const id = await uploadImage(dataUri, ctx, config, state, flavor, logUpload);
+			const id = await uploadImage(dataUri, ctx, config, state, flavor, logUpload, toolCallId);
 			if (id) {
 				state.transformed += 1;
 				replacedInRequest += 1;

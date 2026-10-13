@@ -172,10 +172,10 @@ async function harness(t: test.TestContext, options: HarnessOptions = {}) {
 			}
 			return current;
 		},
-		async emitToolResult(content: any[], input: Record<string, unknown> = {}) {
+		async emitToolResult(content: any[], input: Record<string, unknown> = {}, toolCallId = "call-1") {
 			for (const handler of handlers["tool_result"] ?? []) {
 				await handler(
-					{ type: "tool_result", toolName: "read", toolCallId: "call-1", input, content, isError: false },
+					{ type: "tool_result", toolName: "read", toolCallId, input, content, isError: false },
 					ctx,
 				);
 			}
@@ -778,15 +778,33 @@ test("reusing an image from the on-disk cache is not logged", async (t) => {
 	assert.match(await second.command("stats"), /cache hits: 1/);
 });
 
-test("logs the source file name for images from the read tool", async (t) => {
-	const h = await harness(t, { modelsJson: providerConfig(true) });
+test("logs the source file name for an image from the read tool", async (t) => {
+	const h = await harness(t, {
+		modelsJson: providerConfig(true),
+		model: { api: "anthropic-messages", baseUrl: "https://api.deepseek.com/anthropic" },
+	});
 	h.setFetch(async () => fileResponse("file-named"));
 	const dataUri = png("photo");
 	const base64 = dataUri.slice(dataUri.indexOf(",") + 1);
 	await h.emitToolResult([{ type: "image", data: base64, mimeType: "image/png" }], {
 		path: "/tmp/pictures/cat.png",
 	});
-	await h.emit(completionsPayload(dataUri));
+	await h.emit({
+		model: "m",
+		max_tokens: 10,
+		messages: [
+			{
+				role: "user",
+				content: [
+					{
+						type: "tool_result",
+						tool_use_id: "call-1",
+						content: [{ type: "image", source: { type: "base64", media_type: "image/png", data: base64 } }],
+					},
+				],
+			},
+		],
+	});
 
 	assert.equal(h.entries.length, 1);
 	assert.equal(h.entries[0].data.id, "file-named");
@@ -794,6 +812,100 @@ test("logs the source file name for images from the read tool", async (t) => {
 	assert.match(h.renderEntry("files-api-log", h.entries[0].data), /files-api: uploaded cat\.png \(.*\) file-named/);
 	const file = formValue(h.calls[0], "file") as { name: string };
 	assert.equal(file.name, "cat.png");
+});
+
+test("maps an image to its exact read tool call even when files share bytes", async (t) => {
+	const h = await harness(t, {
+		modelsJson: providerConfig(true),
+		model: { api: "anthropic-messages", baseUrl: "https://api.deepseek.com/anthropic" },
+	});
+	h.setFetch(async () => fileResponse("file-direct"));
+	const dataUri = png("same-bytes");
+	const base64 = dataUri.slice(dataUri.indexOf(",") + 1);
+	const image = [{ type: "image", data: base64, mimeType: "image/png" }];
+	// Both reads returned identical bytes, so only the tool call id can tell them
+	// apart; the name must come from the call, never from the content.
+	await h.emitToolResult(image, { path: "/a/dog.png" }, "call-2");
+	await h.emitToolResult(image, { path: "/a/cat.png" }, "call-1");
+
+	await h.emit({
+		model: "m",
+		max_tokens: 10,
+		messages: [
+			{
+				role: "user",
+				content: [
+					{
+						type: "tool_result",
+						tool_use_id: "call-1",
+						content: [
+							{ type: "text", text: "Read image file [image/png]" },
+							{ type: "image", source: { type: "base64", media_type: "image/png", data: base64 } },
+						],
+					},
+				],
+			},
+			{
+				role: "user",
+				content: [
+					{
+						type: "tool_result",
+						tool_use_id: "call-2",
+						content: [
+							{ type: "image", source: { type: "base64", media_type: "image/png", data: base64 } },
+						],
+					},
+				],
+			},
+		],
+	});
+
+	assert.equal(h.entries.length, 1);
+	assert.match(h.entries[0].data.detail, /^uploaded cat\.png \(/);
+	const file = formValue(h.calls[0], "file") as { name: string };
+	assert.equal(file.name, "cat.png");
+});
+
+test("maps an image to its function call output in openai-responses", async (t) => {
+	const h = await harness(t, {
+		modelsJson: providerConfig(true),
+		model: { api: "openai-responses" },
+	});
+	h.setFetch(async () => fileResponse("file-fc"));
+	const dataUri = png("resp");
+	const base64 = dataUri.slice(dataUri.indexOf(",") + 1);
+	await h.emitToolResult([{ type: "image", data: base64, mimeType: "image/png" }], { path: "/a/plot.png" }, "call_x");
+	await h.emit({
+		model: "m",
+		input: [
+			{ type: "function_call", call_id: "call_x", name: "read", arguments: '{"path":"/a/plot.png"}' },
+			{
+				type: "function_call_output",
+				call_id: "call_x",
+				output: [
+					{ type: "input_text", text: "Read image file [image/png]" },
+					{ type: "input_image", detail: "auto", image_url: `data:image/png;base64,${base64}` },
+				],
+			},
+		],
+	});
+	assert.equal(h.entries.length, 1);
+	assert.match(h.entries[0].data.detail, /^uploaded plot\.png \(/);
+});
+
+test("leaves detached OpenAI Completions tool images unnamed", async (t) => {
+	// The completions adapter moves tool-result images into a synthetic user
+	// message, so there is no tool call id to correlate; no name is guessed.
+	const h = await harness(t, { modelsJson: providerConfig(true) });
+	h.setFetch(async () => fileResponse("file-anon"));
+	const dataUri = png("photo");
+	const base64 = dataUri.slice(dataUri.indexOf(",") + 1);
+	await h.emitToolResult([{ type: "image", data: base64, mimeType: "image/png" }], { path: "/a/cat.png" });
+	await h.emit(completionsPayload(dataUri));
+	assert.equal(h.entries.length, 1);
+	assert.match(h.entries[0].data.detail, /^uploaded \(/);
+	const file = formValue(h.calls[0], "file") as { name: string };
+	assert.match(file.name, /^image-[0-9a-f]{12}\.png$/);
 });
 
 test("logs an image once even when it is referenced repeatedly in one request", async (t) => {
