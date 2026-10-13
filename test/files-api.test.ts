@@ -732,7 +732,7 @@ test("file_id cache persists to disk across instances", async (t) => {
 // logging
 // ---------------------------------------------------------------------------
 
-test("logs an upload and a later reuse of the same image", async (t) => {
+test("logs an image once and stays quiet on later requests", async (t) => {
 	const h = await harness(t, { modelsJson: providerConfig(true) });
 	h.setFetch(async () => fileResponse("file-log"));
 	await h.emit(completionsPayload(png("a")));
@@ -744,13 +744,37 @@ test("logs an upload and a later reuse of the same image", async (t) => {
 	assert.equal(h.notifications.length, 0);
 	assert.match(h.renderEntry("files-api-log", upload!.data), /files-api: uploaded .* file-log/);
 
-	h.entries.length = 0;
+	// Replaying the same image on later requests must not append more lines.
+	await h.emit(completionsPayload(png("a")));
 	await h.emit(completionsPayload(png("a")));
 	assert.equal(h.entries.length, 1);
-	assert.deepEqual(h.entries[0].data, { detail: "reused", id: "file-log" });
+	assert.equal(h.notifications.length, 0);
 });
 
-test("logs each file id once per request when it is referenced repeatedly", async (t) => {
+test("logs a reuse once when an image comes from the on-disk cache", async (t) => {
+	const agentDir = mkdtempSync(join(tmpdir(), "pi-files-api-log-cache-"));
+	t.after(() => rmSync(agentDir, { recursive: true, force: true }));
+	const modelsJson = providerConfig(true);
+
+	const first = await harness(t, { agentDir, modelsJson });
+	first.setFetch(async () => fileResponse("file-persist-log"));
+	await first.emit(completionsPayload(png("a")));
+	assert.equal(first.entries.length, 1);
+
+	const second = await harness(t, { agentDir, modelsJson });
+	second.setFetch(async () => {
+		throw new Error("should not upload");
+	});
+	await second.emit(completionsPayload(png("a")));
+	assert.equal(second.entries.length, 1);
+	assert.deepEqual(second.entries[0].data, { detail: "reused", id: "file-persist-log" });
+
+	// A later request in the same session reuses it silently.
+	await second.emit(completionsPayload(png("a")));
+	assert.equal(second.entries.length, 1);
+});
+
+test("logs an image once even when it is referenced repeatedly in one request", async (t) => {
 	const h = await harness(t, { modelsJson: providerConfig(true) });
 	h.setFetch(async () => fileResponse("file-dup"));
 	const payload = {

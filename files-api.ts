@@ -49,8 +49,9 @@
  *
  * Each resolved image is logged as a dim line in the transcript (a custom entry,
  * not sent to the model; stderr outside the TUI): `uploaded (<size>) <file_id>`
- * for a fresh upload, `reused <file_id>` for a memory/disk cache hit (once per
- * file id per request). It is not a popup notification.
+ * for a fresh upload, `reused <file_id>` for a memory/disk cache hit. Each file
+ * id is logged once per session, when it first enters the conversation. It is not
+ * a popup notification.
  *
  * Usage:
  *   npx @earendil-works/pi-coding-agent --extension ./files-api.ts
@@ -157,6 +158,8 @@ interface RuntimeState {
 	failureCounts: Map<string, number>;
 	/** Endpoint -> epoch ms until which uploads are skipped. */
 	backoffUntil: Map<string, number>;
+	/** File ids already logged this session, so a replayed image is not logged again. */
+	logged: Set<string>;
 }
 
 function newState(): RuntimeState {
@@ -176,6 +179,7 @@ function newState(): RuntimeState {
 		inflight: new Map(),
 		failureCounts: new Map(),
 		backoffUntil: new Map(),
+		logged: new Set(),
 	};
 }
 
@@ -840,12 +844,12 @@ export default function (pi: ExtensionAPI) {
 
 		const flavor = resolveFlavor(ctx, config, api);
 		let replacedInRequest = 0;
-		// Report each image once per request; repeated references to the same file
-		// id share a line. In the TUI this lands in the transcript, not a popup.
-		const logged = new Set<string>();
+		// Report each image only once per session, at the request where it first
+		// enters the conversation, so historical images replayed on later turns do
+		// not keep appending lines under unrelated tool calls.
 		const log: LogResolution = (id, detail) => {
-			if (logged.has(id)) return;
-			logged.add(id);
+			if (state.logged.has(id)) return;
+			state.logged.add(id);
 			if (ctx.mode === "tui") pi.appendEntry(LOG_ENTRY_TYPE, { detail, id });
 			else console.error(`[files-api] ${detail} ${id}`);
 		};
